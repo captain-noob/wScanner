@@ -19,6 +19,7 @@ import (
  "sync"
   "time"
   "reflect"
+  "os/user"
 )
 
 const (
@@ -31,14 +32,24 @@ const (
     Bold   = "\033[1m"
 )
 
+const version = "1.0.0"
+
+const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
+const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
+const remotePorts = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/ports.txt"
+// const remoteWappalyzer = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/wappalyzer.json"
+
+
 
 var (
-portsFile = flag.String("ports-file", "ports.txt", "file with newline-separated ports to probe")
-inputFile = flag.String("input", "", "file with newline-separated hostnames or IPs")
-host = flag.String("host", "", "file with newline-separated hostnames or IPs")
-verbose = flag.Bool("v", false, "verbose mode")
-time_out = flag.Int("timeout", 15, "timeout duration in SECONDS for each request")
-stdout = flag.Bool("stdout", true, "single target host/IP to probe")
+portsFile = flag.String("ports-file", "ports.txt", "File containing **newline-separated ports** to probe.")
+inputFile = flag.String("input", "", "File containing **newline-separated hostnames or IP addresses** to scan.")
+host = flag.String("host", "", "Single **hostname or IP address** to scan (alternative to -input).")
+verbose = flag.Bool("v", false, "Enable **verbose** output mode.")
+time_out = flag.Int("timeout", 15, "Timeout duration in **seconds** for each probe/request.")
+stdout = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
+local = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
+updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
 // csvOut = flag.String("out", "results.csv", "CSV output file")
 // randomUA = flag.Bool("random-ua", true, "enable random User-Agent selection")
 // proxy = flag.String("proxy", "", "single HTTP proxy to use (eg http://127.0.0.1:8080)")
@@ -75,6 +86,73 @@ var csvHeaders = []string{
 "cdn_waf",
 }
 
+var userAgentsFile *string
+var headersFile *string
+
+func downloadFile(url string, filepath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func checkAndDownloadAssets() bool {
+	currentUser, _ := user.Current()
+	homeDir := currentUser.HomeDir
+	assetDir := homeDir + string(os.PathSeparator) + ".config" + string(os.PathSeparator) + "wScanner" + string(os.PathSeparator) 
+	if _, err := os.Stat(assetDir); os.IsNotExist(err) {
+		err := os.MkdirAll(assetDir, 0755)
+		if err != nil {
+			fmt.Printf("%s[!] Error:%s Failed to create asset directory: %v\n", Red, Reset, err)
+			return false
+		}
+	}
+
+	portsPath := assetDir + "ports.txt"
+	if _, err := os.Stat(portsPath); os.IsNotExist(err) || *updateConfig {
+		fmt.Printf("%s[+] Downloading ports file...%s\n", Cyan, Reset)
+		err := downloadFile(remotePorts, portsPath)
+		if err != nil {
+			fmt.Printf("%s[!] Error:%s Failed to download ports file: %v\n", Red, Reset, err)
+			return false
+		}
+	}
+	uaPath := assetDir + "user-agent.txt"
+	if _, err := os.Stat(uaPath); os.IsNotExist(err) || *updateConfig {
+		fmt.Printf("%s[+] Downloading user-agent file...%s\n", Cyan, Reset)
+		err := downloadFile(remoteUserAgents, uaPath)
+		if err != nil {
+			fmt.Printf("%s[!] Error:%s Failed to download user-agent file: %v\n", Red, Reset, err)
+			return false
+		}
+	}
+
+	headersPath := assetDir + "headers.json"
+	if _, err := os.Stat(headersPath); os.IsNotExist(err) || *updateConfig {
+		fmt.Printf("%s[+] Downloading headers file...%s\n", Cyan, Reset)
+		err := downloadFile(remoteHeaders, headersPath)
+		if err != nil {
+			fmt.Printf("%s[!] Error:%s Failed to download headers file: %v\n", Red, Reset, err)
+			return false
+		}
+	}
+
+	portsFile = &portsPath
+	userAgentsFile = &uaPath
+	headersFile = &headersPath
+
+	return true
+}
 
 func StartSpinner(stopChan chan bool) {
 	spinner := []rune{'|', '/', '-', '\\'}
@@ -117,7 +195,7 @@ func readInputFile(filePath string) ([]string, error) {
 }
 
 func getRandomUserAgent() string {
-	userAgents, err := readInputFile("user-agent.txt")
+	userAgents, err := readInputFile(*userAgentsFile)
 	if err != nil || len(userAgents) == 0 {
 		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36"
 	}
@@ -410,7 +488,7 @@ func getResponse(item ScanResult) ResponseResult {
 	
 
 
-	raw_json, err := readInputFile("headers.json")
+	raw_json, err := readInputFile(*headersFile)
 	headersData := []byte(strings.Join(raw_json, "\n"))
 	if err != nil {
 		fmt.Printf("Error reading headers file: %v\n", err)
@@ -647,11 +725,34 @@ func main() {
 
 	flag.Parse()
 
+
+
 	// --- Input Validation ---
 	if flag.NFlag() == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+
+	// Banner / Internet Check
+	
+	if CheckInternet() {
+		fmt.Printf("%s[+] Internet Connection:%s %sONLINE%s\n", Green, Reset, Bold, Reset)
+	} else {
+		fmt.Printf("%s[-] Internet Connection:%s %sOFFLINE%s\n", Red, Reset, Red, Reset)
+		if !*local {
+			fmt.Printf("%s[!] Error:%s Internet connection is required unless running in local mode (-local)\n", Red, Reset)
+			os.Exit(1)
+		}
+	}
+
+	if !checkAndDownloadAssets() {
+		fmt.Printf("%s[!] Error:%s Failed to download necessary assets\n", Red, Reset)
+		os.Exit(1)
+	}
+
+	// os.Exit(1)
+
 
 	if *inputFile != "" && *host != "" {
 		fmt.Printf("%s[!] Error:%s Please provide only one of -input or -host\n", Red, Reset)
@@ -672,13 +773,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Banner / Internet Check
 	
-	if CheckInternet() {
-		fmt.Printf("%s[+] Internet Connection:%s %sONLINE%s\n", Green, Reset, Bold, Reset)
-	} else {
-		fmt.Printf("%s[-] Internet Connection:%s %sOFFLINE%s\n", Red, Reset, Red, Reset)
-	}
+	
+	
 
 	// --- Scanning Phase ---
 	var probeResults ResponseResultList
