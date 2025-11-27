@@ -438,6 +438,9 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 	if totalPorts < workerCount {
 		workerCount = totalPorts
 	}
+	if workerCount > maxWorkers {
+		workerCount = maxWorkers
+	}
 
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
