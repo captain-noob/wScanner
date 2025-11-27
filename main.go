@@ -32,7 +32,7 @@ const (
     Bold   = "\033[1m"
 )
 
-const version = "1.2.0"
+const version = "1.2.1"
 
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
@@ -50,7 +50,7 @@ time_out = flag.Int("timeout", 15, "Timeout duration in **seconds** for each pro
 stdout = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
 local = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
 updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
-maxRPS = flag.Int("rps",  ,"Maximum cuncurrent requests per second (global)")
+maxRPS = flag.Int("rps", 0,"Maximum cuncurrent requests per second (global)")
 // csvOut = flag.String("out", "results.csv", "CSV output file")
 // randomUA = flag.Bool("random-ua", true, "enable random User-Agent selection")
 // proxy = flag.String("proxy", "", "single HTTP proxy to use (eg http://127.0.0.1:8080)")
@@ -444,7 +444,7 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 		workerCount = maxWorkers
 	}
 
-	if *maxRPS != nil && *maxRPS > 0 && workerCount > *maxRPS {
+	if  *maxRPS > 0 && workerCount > *maxRPS {
 		workerCount = *maxRPS
 	}
 
