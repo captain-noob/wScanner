@@ -435,61 +435,43 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 
 	var wg sync.WaitGroup
 	
-	// workerCount := maxWorkers
+	workerCount := maxWorkers
 
-	// if  *maxRPS > 0 && workerCount < *maxRPS {
-	// 	workerCount = *maxRPS
-	// }
+	if  *maxRPS > 0 && workerCount < *maxRPS {
+		workerCount = *maxRPS
+	}
 
-	// fmt.Printf("%s[*]%s Setting concurrency limit to: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
+	fmt.Printf("%s[*]%s Setting concurrency limit to: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
 	
 	bar := NewProgressBar(maxtotalJobs)
 
-	// for i := 0; i < workerCount; i++ {
-	// 	wg.Add(1)
-	// 	go func() {
-	// 		defer wg.Done()
-	// 		for itemX := range jobs {
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for itemX := range jobs {
 				
-	// 			if checkForOpenPort(itemX.IP, itemX.Port) {
-	// 				results <- itemX
-	// 			} else if *verbose { // Using the global 'verbose' for output
-	// 				fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
-	// 			}
-	// 			bar.Update(1)
-	// 		}
-	// 	}()
-	// }
+				if checkForOpenPort(itemX.IP, itemX.Port) {
+					results <- itemX
+				} else if *verbose { // Using the global 'verbose' for output
+					fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
+				}
+				bar.Update(1)
+			}
+		}()
+	}
 
+	
 	for _, target := range targets {
 		// 2. Send Jobs
 		for _, port := range ports {
-			wg.Add(1)
-			go func(t string, p string) {
-				defer wg.Done()
-				if checkForOpenPort(t, p) {
-					results <- targetItem{
-						IP:   t,
-						Port: p,
-					}
-				} else if *verbose { // Using the global 'verbose' for output
-					fmt.Printf("Port %s is closed on %s\n", p, t)
-				}
-				bar.Update(1)
-			}(target, port)
+			targetItem := targetItem{
+				IP:   target,
+				Port: port,
+			}
+			jobs <- targetItem
 		}
 	}
-
-	// for _, target := range targets {
-	// 	// 2. Send Jobs
-	// 	for _, port := range ports {
-	// 		targetItem := targetItem{
-	// 			IP:   target,
-	// 			Port: port,
-	// 		}
-	// 		jobs <- targetItem
-	// 	}
-	// }
 
 
 	close(jobs)
