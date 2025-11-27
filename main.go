@@ -50,13 +50,13 @@ time_out = flag.Int("timeout", 15, "Timeout duration in **seconds** for each pro
 stdout = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
 local = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
 updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
+maxRPS = flag.Int("rps",  ,"Maximum cuncurrent requests per second (global)")
 // csvOut = flag.String("out", "results.csv", "CSV output file")
 // randomUA = flag.Bool("random-ua", true, "enable random User-Agent selection")
 // proxy = flag.String("proxy", "", "single HTTP proxy to use (eg http://127.0.0.1:8080)")
 // proxiesFile = flag.String("proxies-file", "", "file with proxies (http,socks4,socks5) one per line")
 // tenableTor = flag.Bool("tor", false, "enable Tor (NOTE: must configure proxy that routes to Tor) (default false)")
 // threads = flag.Int("threads", 50, "number of concurrent workers")
-// maxRPS = flag.Int("rps", 150, "maximum requests per second (global)")
 // delayStr = flag.String("delay", "-1ns", "duration between each http request per worker (eg: 200ms, 1s). default -1ns (no delay)")
 // screenshot = flag.Bool("screenshot", false, "save screenshot of page using headless browser")
 // wappalyzerDB = flag.String("wappalyzer", "wappalyzer.json", "local Wappalyzer-like json dataset to detect technologies")
@@ -351,6 +351,10 @@ func probePorts(target string, ports []string) ScanResultList {
 		workerCount = totalPorts
 	}
 
+	// if *maxRPS != nil && *maxRPS > 0 && workerCount > *maxRPS {
+	// 	workerCount = *maxRPS
+	// }
+
 	// 1. Start Workers
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
@@ -414,9 +418,7 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 		maxWorkers = maxtotalJobs
 	}
 
-    if verbose != nil && *verbose {
-        fmt.Printf("Setting concurrency limit to %d based on system ulimit and job count\n", maxWorkers)
-    }
+    
 	
 
     bar := NewProgressBar(maxtotalJobs)
@@ -441,6 +443,14 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 	if workerCount > maxWorkers {
 		workerCount = maxWorkers
 	}
+
+	if *maxRPS != nil && *maxRPS > 0 && workerCount > *maxRPS {
+		workerCount = *maxRPS
+	}
+
+	if verbose != nil && *verbose {
+        fmt.Printf("Setting concurrency limit to %d ", maxWorkers)
+    }
 
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
