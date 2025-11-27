@@ -32,7 +32,7 @@ const (
     Bold   = "\033[1m"
 )
 
-const version = "1.0.1"
+const version = "1.2.0"
 
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
