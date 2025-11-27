@@ -1,5 +1,7 @@
 package main
 
+import "sync"
+
 type PortScanResult map[string][]string
 
 type ScanResult struct {
@@ -49,4 +51,14 @@ type HeaderConfig struct {
 	CacheOptimization []HeaderPurpose `json:"cache_optimization"`
 	HostingPlatform []HeaderPurpose `json:"hosting_platform"`
 	ApplicationInternal []HeaderPurpose `json:"application_internal"`
+}
+
+
+type ProgressBar struct {
+	Total     int
+	Current   int
+	Width     int // Now determined internally
+	BarChar   string
+	EmptyChar string
+	Mux       sync.Mutex
 }

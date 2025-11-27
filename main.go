@@ -172,6 +172,59 @@ func StartSpinner(stopChan chan bool) {
 }
 
 
+func NewProgressBar(total int) *ProgressBar {
+    const defaultWidth = 60
+	return &ProgressBar{
+		Total:     total,
+		Current:   0,
+		Width:     defaultWidth,
+		BarChar:   "█",
+		EmptyChar: "░",
+	}
+}
+
+// Update increments the progress bar safely and prints the new state.
+func (pb *ProgressBar) Update(step int) {
+    // 1. Lock the Mutex before modifying shared state (Current)
+    pb.Mux.Lock()
+    // 2. Ensure the Mutex is unlocked when the function exits, regardless of how it exits
+    defer pb.Mux.Unlock()
+
+    // Now, only one goroutine can execute the following code block at a time
+
+	pb.Current += step
+	if pb.Current > pb.Total {
+		pb.Current = pb.Total
+	}
+
+	percentage := float64(pb.Current) / float64(pb.Total)
+	filledWidth := int(percentage * float64(pb.Width))
+
+	filledPart := strings.Repeat(pb.BarChar, filledWidth)
+	emptyPart := strings.Repeat(pb.EmptyChar, pb.Width-filledWidth)
+
+	// Note: We use fmt.Fprint(os.Stdout, ...) or just fmt.Print here.
+    // Console output for the progress bar itself is inherently tricky in concurrent contexts,
+    // as multiple goroutines could try to print to the screen simultaneously.
+    // However, the mutex ensures the *data calculation* is safe.
+    // If you see garbled output, you may need a global lock around ALL printing too.
+    // For this simple case, locking the Update function is usually sufficient.
+	output := fmt.Sprintf("\r\tProgress: [%s%s] %.2f%% (%d/%d)",
+		filledPart,
+		emptyPart,
+		percentage*100,
+		pb.Current,
+		pb.Total,
+	)
+
+	fmt.Print(output)
+
+	if pb.Current == pb.Total {
+		fmt.Println()
+	}
+}
+
+
 func CheckInternet() bool {
 	timeout := 3 * time.Second
 	_, err := net.DialTimeout("tcp", "8.8.8.8:53", timeout)
@@ -277,8 +330,7 @@ func checkForOpenPort(host string, port string) bool {
 func probePorts(target string, ports []string) ScanResultList {
 	totalPorts := len(ports)
 
-    stop := make(chan bool)
-    go StartSpinner(stop)
+    bar := NewProgressBar(totalPorts)
 
 	// We use the full length of ports for the channel buffer size
 	jobs := make(chan string, totalPorts)
@@ -305,13 +357,16 @@ func probePorts(target string, ports []string) ScanResultList {
 		go func() {
 			defer wg.Done()
 			for port := range jobs {
+				
 				// The fixed probePorts now passes the timeout duration
 				if checkForOpenPort(target, port) {
+					
 					// fmt.Printf("\r [%s] Probing for open ports ... \r", time.Now().Format("15:04:05"))
 					results <- port
 				} else if *verbose { // Using the global 'verbose' for output
 					fmt.Printf("Port %s is closed on %s\n", port, target)
 				}
+				bar.Update(1)
 			}
 		}()
 	}
@@ -339,7 +394,7 @@ func probePorts(target string, ports []string) ScanResultList {
 		})
 	}
 
-    stop <- true
+    // stop <- true
 
 	return openPorts
 }
@@ -364,8 +419,7 @@ func probeTargets(targets []string, ports []string) ScanResultList{
     }
 	
 
-    stop := make(chan bool)
-    go StartSpinner(stop)
+    bar := NewProgressBar(maxtotalJobs)
 
 
 	type targetItem struct {
@@ -390,12 +444,13 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 		go func() {
 			defer wg.Done()
 			for itemX := range jobs {
+				
 				if checkForOpenPort(itemX.IP, itemX.Port) {
-					// fmt.Printf("\r [%s] Probing for open ports ... \r", time.Now().Format("15:04:05"))
 					results <- itemX
 				} else if *verbose { // Using the global 'verbose' for output
 					fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
 				}
+				bar.Update(1)
 			}
 		}()
 	}
@@ -426,7 +481,6 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 		})
 	}
 
-    stop <- true
 
 	return openPorts
 }
@@ -581,43 +635,42 @@ func getResponse(item ScanResult) ResponseResult {
 func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 	var wg sync.WaitGroup
 
-		// jobs := make(chan ScanResult, len(openPorts))
-		results := make(chan ResponseResult, len(openPorts)) 
+	// jobs := make(chan ScanResult, len(openPorts))
+	results := make(chan ResponseResult, len(openPorts)) 
 
-        stop := make(chan bool)
-        go StartSpinner(stop)
+	bar := NewProgressBar(len(openPorts))
 
+	
+	
+
+	for _, port := range openPorts {
+		wg.Add(1)
 		
+
+		go func(p ScanResult) { // pass as value to avoid loop variable capture
+			defer wg.Done()
+			// fmt.Printf("\r [%s] Probing Headers ... \r", time.Now().Format("15:04:05"))
+			x := getResponse(p)
+			results <- x
+			bar.Update(1)
+		}(port)
+	}
+
+	// Close channel once all goroutines finish
+	go func() {
 		
+		wg.Wait()
+		close(results)
+	}()
 
-		for _, port := range openPorts {
-			wg.Add(1)
-
-			go func(p ScanResult) { // pass as value to avoid loop variable capture
-				defer wg.Done()
-				// fmt.Printf("\r [%s] Probing Headers ... \r", time.Now().Format("15:04:05"))
-				x := getResponse(p)
-				results <- x
-
-			}(port)
-		}
-
-		// Close channel once all goroutines finish
-		go func() {
-			
-			wg.Wait()
-			close(results)
-		}()
-
-		// Read concurrent results
-		
-		resp := ResponseResultList{}
-		for r := range results {
-			resp = append(resp, r)
-		}
-        stop <- true
-		
-		return resp
+	// Read concurrent results
+	
+	resp := ResponseResultList{}
+	for r := range results {
+		resp = append(resp, r)
+	}
+	
+	return resp
 }
 
 func SaveReport(results ResponseResultList) (string, error) {
