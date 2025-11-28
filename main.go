@@ -32,14 +32,16 @@ const (
     Bold   = "\033[1m"
 )
 
-const version = "1.2.1"
+const version = "beta-v2.0.0"
 
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
 const remotePorts = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/ports.txt"
 // const remoteWappalyzer = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/wappalyzer.json"
 
+var folderName = "wScanner_" + time.Now().Format("20060102_150405")
 
+var isProgressBarCompleted = false
 
 var (
 portsFile = flag.String("ports-file", "ports.txt", "File containing **newline-separated ports** to probe.")
@@ -173,13 +175,14 @@ func StartSpinner(stopChan chan bool) {
 
 
 func NewProgressBar(total int) *ProgressBar {
-    const defaultWidth = 60
+	const defaultWidth = 60
 	return &ProgressBar{
 		Total:     total,
 		Current:   0,
 		Width:     defaultWidth,
 		BarChar:   "█",
 		EmptyChar: "░",
+		Mux:       sync.Mutex{},
 	}
 }
 
@@ -193,6 +196,7 @@ func (pb *ProgressBar) Update(step int) {
     // Now, only one goroutine can execute the following code block at a time
 
 	pb.Current += step
+	isProgressBarCompleted = false
 	if pb.Current > pb.Total {
 		pb.Current = pb.Total
 	}
@@ -221,6 +225,7 @@ func (pb *ProgressBar) Update(step int) {
 
 	if pb.Current == pb.Total {
 		fmt.Println()
+		isProgressBarCompleted = true
 	}
 }
 
@@ -444,6 +449,7 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 	fmt.Printf("%s[*]%s Setting concurrency limit to: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
 	
 	bar := NewProgressBar(maxtotalJobs)
+	currentJob := 0
 
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
@@ -456,6 +462,7 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 				} else if *verbose { // Using the global 'verbose' for output
 					fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
 				}
+				currentJob++
 				bar.Update(1)
 			}
 		}()
@@ -482,7 +489,32 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 	}()
 
 	var openPorts ScanResultList
+	
+	fname := folderName + "/open_ports_initial.txt"
+	file, err := os.Create(fname)
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s Failed to create open ports file: %v\n", Red, Reset, err)
+	}
+	
+	
+	
+
 	for r := range results {
+		// fmt.Printf("%d",)
+
+		if isProgressBarCompleted{
+			fmt.Printf("\r%s%s [*] %sWaiting for all goroutines to complete: %s[%d] left%s   ",
+				Cyan, Bold,   // [*] style
+				Reset,        // Reset text color for the message
+				Red,          // Style for the number
+				len(results), // The remaining count
+				Reset,        // Always reset at the end
+			)
+		}
+		if file != nil {
+			line := fmt.Sprintf("%s:%s\n", r.IP, r.Port)
+			file.WriteString(line)
+		}
 		openPorts = append(openPorts, ScanResult{
 			IP:     r.IP,
 			Port:   r.Port,
@@ -490,6 +522,11 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 		})
 	}
 
+	if file != nil {
+		file.Close()
+	}
+
+	fmt.Println()
 
 	return openPorts
 }
@@ -682,13 +719,17 @@ func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 	return resp
 }
 
-func SaveReport(results ResponseResultList) (string, error) {
-    folderName := "wScanner_" + time.Now().Format("20060102_150405")
-    err := os.Mkdir(folderName, 0755)
-    if err != nil {
-		fmt.Println("Error creating folder:", err)
-        return "", err
+func createOutputFolder() bool {
+	err := os.Mkdir(folderName, 0755)
+	if err != nil {
+		return false
 	}
+	return true
+}
+
+func SaveReport(results ResponseResultList) (string, error) {
+    
+    
 
 
     html, err := GenerateHTMLReport(results)
@@ -832,6 +873,11 @@ func main() {
 	ports, err := readInputFile(*portsFile)
 	if err != nil {
 		fmt.Printf("%s[!] Error reading ports file:%s %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+
+	if !createOutputFolder() {
+		fmt.Printf("%s[!] Error:%s Failed to create output folder\n", Red, Reset)
 		os.Exit(1)
 	}
 
