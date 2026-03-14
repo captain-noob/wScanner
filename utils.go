@@ -275,6 +275,23 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
 
         /* Utilities */
         .text-empty { color: #cbd5e1; font-style: italic; }
+
+        /* --- Path Fuzz List --- */
+        .path-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+        .path-item {
+            font-size: 0.85em;
+            padding: 6px 8px;
+            background: #f8fafc;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .path-item .badge-status { font-size: 0.7em; min-width: 36px; text-align: center; }
+        .path-name { word-break: break-all; color: var(--text-main); }
+        .path-redirect { font-size: 0.8em; color: var(--text-muted); margin-left: auto; }
     </style>
 </head>
 <body>
@@ -348,6 +365,7 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                         <th>Server</th>
                         <th style="width: 150px;">Meta</th>
                         <th style="width: 350px;">Recon Data</th>
+                        <th style="width: 300px;">Discovered Paths</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -422,6 +440,27 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                                 <span class="recon-key">{{ .HeaderName }}:</span>
                                 <span class="recon-val">{{ .HeaderValue }}</span>
                             </div>
+                        </li>
+                        {{- end }}
+                        </ul>
+                        {{- else }}
+                        <span class="text-empty">—</span>
+                        {{- end }}
+                    </td>
+
+                    <td>
+                        {{- if gt (len $r.PathResults) 0 }}
+                        <ul class="path-list">
+                        {{- range $r.PathResults }}
+                        <li class="path-item">
+                            <span class="badge badge-status" data-status-val="{{ .StatusCode }}">{{ .StatusCode }}</span>
+                            <span class="path-name">{{ .Path }}</span>
+                            {{- if ne .BypassMethod "" }}
+                            <span class="badge" style="background:#dcfce7;color:#166534;font-size:0.65em;margin-left:4px;">BYPASS: {{ .BypassMethod }}</span>
+                            {{- end }}
+                            {{- if ne .RedirectURL "" }}
+                            <span class="path-redirect">→ {{ .RedirectURL }}</span>
+                            {{- end }}
                         </li>
                         {{- end }}
                         </ul>
@@ -585,4 +624,3 @@ colorizeStatus();
 	}
 	return buf.String(), nil
 }
-

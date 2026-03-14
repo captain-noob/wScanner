@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,12 +38,14 @@ const version = "beta-v2.0.0"
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
 const remotePorts = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/ports.txt"
+const intrestingPaths = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/paths.txt"
 
 // const remoteWappalyzer = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/wappalyzer.json"
 
 var folderName = "wScanner_" + time.Now().Format("20060102_150405")
 
 var isProgressBarCompleted = false
+var activeGoroutines int64
 
 var (
 	portsFile    = flag.String("ports-file", "ports.txt", "File containing **newline-separated ports** to probe.")
@@ -52,17 +56,10 @@ var (
 	stdout       = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
 	local        = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
 	updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
-	maxRPS       = flag.Int("rps", 0, "Maximum cuncurrent requests per second (global)")
-
-// csvOut = flag.String("out", "results.csv", "CSV output file")
-// randomUA = flag.Bool("random-ua", true, "enable random User-Agent selection")
-// proxy = flag.String("proxy", "", "single HTTP proxy to use (eg http://127.0.0.1:8080)")
-// proxiesFile = flag.String("proxies-file", "", "file with proxies (http,socks4,socks5) one per line")
-// tenableTor = flag.Bool("tor", false, "enable Tor (NOTE: must configure proxy that routes to Tor) (default false)")
-// threads = flag.Int("threads", 50, "number of concurrent workers")
-// delayStr = flag.String("delay", "-1ns", "duration between each http request per worker (eg: 200ms, 1s). default -1ns (no delay)")
-// screenshot = flag.Bool("screenshot", false, "save screenshot of page using headless browser")
-// wappalyzerDB = flag.String("wappalyzer", "wappalyzer.json", "local Wappalyzer-like json dataset to detect technologies")
+	maxRPS       = flag.Int("rps", 0, "Maximum concurrent requests per second (global)")
+	outputDir    = flag.String("output", "", "Custom **output folder** name (default: wScanner_YYYYMMDD_HHMMSS).")
+	csvOut       = flag.Bool("csv", false, "Generate a **CSV** results file in the output folder.")
+	pathFile     = flag.String("path", "", "Custom **wordlist** file for directory/path fuzzing.")
 )
 
 // CSV columns
@@ -90,6 +87,7 @@ var csvHeaders = []string{
 
 var userAgentsFile *string
 var headersFile *string
+var pathsFile *string
 
 // --- Cached data (loaded once at startup) ---
 var cachedUserAgents []string
@@ -176,12 +174,25 @@ func checkAndDownloadAssets() bool {
 		}
 	}
 
+	// Download paths wordlist
+	pathsPath := assetDir + "paths.txt"
+	if _, err := os.Stat(pathsPath); os.IsNotExist(err) || *updateConfig {
+		fmt.Printf("%s[+] Downloading paths wordlist...%s\n", Cyan, Reset)
+		err := downloadFile(intrestingPaths, pathsPath)
+		if err != nil {
+			fmt.Printf("%s[!] Warning:%s Failed to download paths file: %v\n", Yellow, Reset, err)
+			// Not fatal — fuzzing is optional
+		}
+	}
+
 	pPath := portsPath
 	portsFile = &pPath
 	uPath := uaPath
 	userAgentsFile = &uPath
 	hPath := headersPath
 	headersFile = &hPath
+	pthPath := pathsPath
+	pathsFile = &pthPath
 
 	return true
 }
@@ -242,12 +253,16 @@ func (pb *ProgressBar) Update(step int) {
 	// However, the mutex ensures the *data calculation* is safe.
 	// If you see garbled output, you may need a global lock around ALL printing too.
 	// For this simple case, locking the Update function is usually sufficient.
-	output := fmt.Sprintf("\r\tProgress: [%s%s] %.2f%% (%d/%d)",
+	active := atomic.LoadInt64(&activeGoroutines)
+	output := fmt.Sprintf("\r\tProgress: [%s%s] %.2f%% (%d/%d) | %s%d active%s",
 		filledPart,
 		emptyPart,
 		percentage*100,
 		pb.Current,
 		pb.Total,
+		Cyan,
+		active,
+		Reset,
 	)
 
 	fmt.Print(output)
@@ -381,8 +396,8 @@ func probePorts(target string, ports []string) ScanResultList {
 		go func() {
 			defer wg.Done()
 			for port := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
 				if checkForOpenPort(target, port) {
-					// Perf #7: detect scheme inside worker goroutine
 					results <- ScanResult{
 						IP:     target,
 						Port:   port,
@@ -391,6 +406,7 @@ func probePorts(target string, ports []string) ScanResultList {
 				} else if *verbose {
 					fmt.Printf("Port %s is closed on %s\n", port, target)
 				}
+				atomic.AddInt64(&activeGoroutines, -1)
 				bar.Update(1)
 			}
 		}()
@@ -454,8 +470,8 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 		go func() {
 			defer wg.Done()
 			for itemX := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
 				if checkForOpenPort(itemX.IP, itemX.Port) {
-					// Perf #7: detect scheme inside worker goroutine
 					results <- ScanResult{
 						IP:     itemX.IP,
 						Port:   itemX.Port,
@@ -464,6 +480,7 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 				} else if *verbose {
 					fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
 				}
+				atomic.AddInt64(&activeGoroutines, -1)
 				bar.Update(1)
 			}
 		}()
@@ -655,8 +672,10 @@ func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
 				x := getResponse(p)
 				results <- x
+				atomic.AddInt64(&activeGoroutines, -1)
 				bar.Update(1)
 			}
 		}()
@@ -681,6 +700,368 @@ func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 	}
 
 	return resp
+}
+
+// fuzzPaths probes each discovered target with a list of paths.
+// Only keeps 2xx, 3xx, and 403 responses.
+// When a 403 is encountered, automatically tries bypass techniques.
+func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
+	if len(paths) == 0 {
+		return results
+	}
+
+	// Count how many targets have a valid scheme
+	validTargets := 0
+	for _, r := range results {
+		if len(r.TargetData.Scheme) > 0 {
+			validTargets++
+		}
+	}
+
+	if validTargets == 0 {
+		return results
+	}
+
+	totalJobs := validTargets * len(paths)
+	fmt.Printf("%s[*]%s Fuzzing %s%d%s paths across %s%d%s targets (%d total requests)...\n",
+		Cyan, Reset, Bold, len(paths), Reset, Bold, validTargets, Reset, totalJobs)
+
+	type fuzzJob struct {
+		ResultIdx int
+		BaseURL   string
+		Path      string
+	}
+
+	type fuzzOut struct {
+		ResultIdx int
+		Result    FuzzResult
+	}
+
+	jobs := make(chan fuzzJob, totalJobs)
+	resultsCh := make(chan fuzzOut, totalJobs)
+
+	var wg sync.WaitGroup
+
+	workerCount := getConcurrencyLimit()
+	if totalJobs < workerCount {
+		workerCount = totalJobs
+	}
+
+	bar := NewProgressBar(totalJobs)
+
+	// Workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			tr := &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+			client := &http.Client{
+				Transport: tr,
+				Timeout:   time.Duration(*time_out) * time.Second,
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse // don't follow redirects
+				},
+			}
+
+			for job := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
+
+				path := strings.TrimLeft(job.Path, "/")
+				fullURL := job.BaseURL + "/" + path
+
+				req, err := http.NewRequest("GET", fullURL, nil)
+				if err != nil {
+					atomic.AddInt64(&activeGoroutines, -1)
+					bar.Update(1)
+					continue
+				}
+				req.Header.Set("User-Agent", getRandomUserAgent())
+
+				resp, err := client.Do(req)
+				if err != nil {
+					atomic.AddInt64(&activeGoroutines, -1)
+					bar.Update(1)
+					continue
+				}
+				resp.Body.Close()
+
+				statusCode := resp.StatusCode
+
+				// If 403, attempt bypass techniques
+				if statusCode == 403 {
+					bypassResult := try403Bypass(client, job.BaseURL, path)
+					if bypassResult != nil {
+						resultsCh <- fuzzOut{
+							ResultIdx: job.ResultIdx,
+							Result:    *bypassResult,
+						}
+					} else {
+						// Report the original 403 as-is
+						resultsCh <- fuzzOut{
+							ResultIdx: job.ResultIdx,
+							Result: FuzzResult{
+								Path:          "/" + path,
+								StatusCode:    403,
+								ContentLength: resp.Header.Get("Content-Length"),
+							},
+						}
+					}
+					atomic.AddInt64(&activeGoroutines, -1)
+					bar.Update(1)
+					continue
+				}
+
+				// Keep 2xx and 3xx
+				keep := statusCode >= 200 && statusCode < 400
+
+				if keep {
+					redirectURL := ""
+					if loc := resp.Header.Get("Location"); loc != "" {
+						redirectURL = loc
+					}
+					resultsCh <- fuzzOut{
+						ResultIdx: job.ResultIdx,
+						Result: FuzzResult{
+							Path:          "/" + path,
+							StatusCode:    statusCode,
+							ContentLength: resp.Header.Get("Content-Length"),
+							RedirectURL:   redirectURL,
+						},
+					}
+				}
+
+				atomic.AddInt64(&activeGoroutines, -1)
+				bar.Update(1)
+			}
+		}()
+	}
+
+	// Send jobs
+	for idx, r := range results {
+		if len(r.TargetData.Scheme) < 1 {
+			continue
+		}
+		baseURL := fmt.Sprintf("%s://%s:%s", r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port)
+		for _, p := range paths {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			jobs <- fuzzJob{ResultIdx: idx, BaseURL: baseURL, Path: p}
+		}
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	// Collect
+	for fr := range resultsCh {
+		results[fr.ResultIdx].PathResults = append(results[fr.ResultIdx].PathResults, fr.Result)
+	}
+
+	fmt.Println()
+	return results
+}
+
+// try403Bypass attempts multiple 403 bypass techniques on a path.
+// Returns a FuzzResult if any bypass succeeds (non-403 response in 2xx/3xx range), nil otherwise.
+func try403Bypass(client *http.Client, baseURL string, path string) *FuzzResult {
+	// --- Technique 1: Header-based bypasses ---
+	bypassHeaders := map[string]string{
+		"X-Forwarded-For":  "127.0.0.1",
+		"X-Real-IP":        "127.0.0.1",
+		"X-Originating-IP": "127.0.0.1",
+		"X-Remote-IP":      "127.0.0.1",
+		"X-Remote-Addr":    "127.0.0.1",
+		"X-ProxyUser-Ip":   "127.0.0.1",
+		"X-Original-URL":   "/" + path,
+		"X-Rewrite-URL":    "/" + path,
+		"Client-IP":        "127.0.0.1",
+		"X-Client-IP":      "127.0.0.1",
+		"X-Host":           "127.0.0.1",
+		"X-Forwarded-Host": "127.0.0.1",
+	}
+
+	fullURL := baseURL + "/" + path
+
+	for hdr, val := range bypassHeaders {
+		req, err := http.NewRequest("GET", fullURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", getRandomUserAgent())
+		req.Header.Set(hdr, val)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			redirectURL := ""
+			if loc := resp.Header.Get("Location"); loc != "" {
+				redirectURL = loc
+			}
+			return &FuzzResult{
+				Path:          "/" + path,
+				StatusCode:    resp.StatusCode,
+				ContentLength: resp.Header.Get("Content-Length"),
+				RedirectURL:   redirectURL,
+				BypassMethod:  fmt.Sprintf("header: %s: %s", hdr, val),
+			}
+		}
+	}
+
+	// --- Technique 2: HTTP method bypass ---
+	for _, method := range []string{"POST", "PUT", "PATCH", "OPTIONS", "TRACE"} {
+		req, err := http.NewRequest(method, fullURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", getRandomUserAgent())
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			redirectURL := ""
+			if loc := resp.Header.Get("Location"); loc != "" {
+				redirectURL = loc
+			}
+			return &FuzzResult{
+				Path:          "/" + path,
+				StatusCode:    resp.StatusCode,
+				ContentLength: resp.Header.Get("Content-Length"),
+				RedirectURL:   redirectURL,
+				BypassMethod:  fmt.Sprintf("method: %s", method),
+			}
+		}
+	}
+
+	// --- Technique 3: Path mutation bypasses ---
+	pathMutations := []struct {
+		mutated string
+		label   string
+	}{
+		{path + "/", "trailing slash"},
+		{path + "/*", "wildcard /*"},
+		{path + "/.", "trailing /."},
+		{path + ";/", "semicolon ;/"},
+		{path + "/..;/", "dot-dot-semicolon /..;/"},
+		{"/" + path + "//", "double slash //"},
+		{"//" + path + "//", "// prefix+suffix"},
+		{"///" + path + "///", "triple slash ///"},
+		{"./" + path + "/./", "dot-slash ./"},
+		{"%2f" + path + "%2f", "URL-encoded %2f"},
+		{path + "%20", "space %20"},
+		{path + "%09", "tab %09"},
+		{path + "..;/", "..;/ suffix"},
+		{strings.ToUpper(path), "UPPERCASE"},
+	}
+
+	for _, pm := range pathMutations {
+		mutURL := baseURL + "/" + strings.TrimLeft(pm.mutated, "/")
+
+		req, err := http.NewRequest("GET", mutURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", getRandomUserAgent())
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			redirectURL := ""
+			if loc := resp.Header.Get("Location"); loc != "" {
+				redirectURL = loc
+			}
+			return &FuzzResult{
+				Path:          "/" + pm.mutated,
+				StatusCode:    resp.StatusCode,
+				ContentLength: resp.Header.Get("Content-Length"),
+				RedirectURL:   redirectURL,
+				BypassMethod:  fmt.Sprintf("path: %s", pm.label),
+			}
+		}
+	}
+
+	return nil
+}
+
+// SaveCSV writes scan results (and path fuzz results) to a CSV file.
+func SaveCSV(results ResponseResultList) error {
+	fname := folderName + "/results.csv"
+	file, err := os.Create(fname)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	w := csv.NewWriter(file)
+	defer w.Flush()
+
+	// Header
+	header := []string{"target", "port", "scheme", "status_code", "content_type",
+		"content_length", "page_title", "server", "redirect_location", "recon_info", "discovered_paths"}
+	if err := w.Write(header); err != nil {
+		return err
+	}
+
+	for _, r := range results {
+		// Build recon summary
+		var reconParts []string
+		for _, info := range r.ReconInfo {
+			reconParts = append(reconParts, fmt.Sprintf("%s: %s=%s", info.CategoryName, info.HeaderName, info.HeaderValue))
+		}
+		reconStr := strings.Join(reconParts, "; ")
+
+		// Build paths summary
+		var pathParts []string
+		for _, pr := range r.PathResults {
+			entry := fmt.Sprintf("%s [%d]", pr.Path, pr.StatusCode)
+			if pr.BypassMethod != "" {
+				entry += " BYPASS(" + pr.BypassMethod + ")"
+			}
+			if pr.RedirectURL != "" {
+				entry += " -> " + pr.RedirectURL
+			}
+			pathParts = append(pathParts, entry)
+		}
+		pathsStr := strings.Join(pathParts, "; ")
+
+		row := []string{
+			r.TargetData.IP,
+			r.TargetData.Port,
+			r.TargetData.Scheme,
+			r.StatusCode,
+			r.ContentType,
+			r.ContentLength,
+			r.PageTitle,
+			r.Server,
+			r.RedirectURi,
+			reconStr,
+			pathsStr,
+		}
+		if err := w.Write(row); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func createOutputFolder() bool {
@@ -768,6 +1149,29 @@ func printStdout(results ResponseResultList) {
 				)
 			}
 		}
+
+		if len(x.PathResults) > 0 {
+			fmt.Printf("\n %s[ Discovered Paths ]%s\n", Yellow, Reset)
+			for _, pr := range x.PathResults {
+				sc := Green
+				if pr.StatusCode >= 300 && pr.StatusCode < 400 {
+					sc = Yellow
+				} else if pr.StatusCode == 403 {
+					sc = Red
+				}
+				line := fmt.Sprintf("   %s+%s %s%d%s %s", Red, Reset, sc, pr.StatusCode, Reset, pr.Path)
+				if pr.BypassMethod != "" {
+					line += fmt.Sprintf(" %s[BYPASS: %s]%s", Green, pr.BypassMethod, Reset)
+				}
+				if pr.RedirectURL != "" {
+					line += fmt.Sprintf(" %s→%s %s", Yellow, Reset, pr.RedirectURL)
+				}
+				if pr.ContentLength != "" {
+					line += fmt.Sprintf(" [%s]", pr.ContentLength)
+				}
+				fmt.Println(line)
+			}
+		}
 		fmt.Println()
 	}
 }
@@ -813,7 +1217,10 @@ func main() {
 	// Load caches once at startup (Bug #6, Perf #9)
 	loadCaches()
 
-	// os.Exit(1)
+	// Apply custom output folder name if provided
+	if *outputDir != "" {
+		folderName = *outputDir
+	}
 
 	if *inputFile != "" && *host != "" {
 		fmt.Printf("%s[!] Error:%s Please provide only one of -input or -host\n", Red, Reset)
@@ -861,6 +1268,22 @@ func main() {
 	fmt.Printf("%s[+]%s Ports probing completed. Probing HTTP responses...\n", Green, Reset)
 	probeResults = probeAllResponses(openPorts)
 
+	// --- Path Fuzzing Phase ---
+	// Determine which path wordlist to use
+	pathWordlist := *pathsFile // default from assets
+	if *pathFile != "" {
+		pathWordlist = *pathFile // user override
+	}
+
+	if pathWordlist != "" {
+		pathLines, err := readInputFile(pathWordlist)
+		if err != nil {
+			fmt.Printf("%s[!] Warning:%s Could not load paths wordlist: %v (skipping path fuzzing)\n", Yellow, Reset, err)
+		} else if len(pathLines) > 0 {
+			probeResults = fuzzPaths(probeResults, pathLines)
+		}
+	}
+
 	// --- Results Display ---
 	if *stdout {
 		printStdout(probeResults)
@@ -872,5 +1295,14 @@ func main() {
 		fmt.Printf("%s[!] Error saving report:%s %v\n", Red, Reset, err)
 	} else {
 		fmt.Printf("%s[✓] Report saved to folder: %s ./%s/\n", Green, Reset, reportFile)
+	}
+
+	// --- CSV Output ---
+	if *csvOut {
+		if err := SaveCSV(probeResults); err != nil {
+			fmt.Printf("%s[!] Error saving CSV:%s %v\n", Red, Reset, err)
+		} else {
+			fmt.Printf("%s[✓] CSV saved to: %s ./%s/results.csv\n", Green, Reset, folderName)
+		}
 	}
 }

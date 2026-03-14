@@ -5,31 +5,43 @@ import "sync"
 type PortScanResult map[string][]string
 
 type ScanResult struct {
-    IP      string 
-    Port    string    
-    Scheme  string 
+	IP     string
+	Port   string
+	Scheme string
 }
 
 type ScanResultList []ScanResult
 
 type ReconInfo struct {
-	CategoryID string
+	CategoryID   string
 	CategoryName string
-	HeaderName string
-	HeaderValue string
-	Purpose string	
+	HeaderName   string
+	HeaderValue  string
+	Purpose      string
 }
 
-type ResponseResult struct {
-	TargetData ScanResult
-	InitialURI string
-	RedirectURi string
-	PageTitle string
-	StatusCode string
-	ContentType string
-	Server string
+// FuzzResult holds the result of a single path probe
+type FuzzResult struct {
+	Path          string
+	StatusCode    int
 	ContentLength string
-	ReconInfo []ReconInfo
+	RedirectURL   string
+	BypassMethod  string // non-empty if a 403 bypass succeeded (e.g. "header: X-Forwarded-For", "path: //admin//")
+}
+
+type FuzzResultList []FuzzResult
+
+type ResponseResult struct {
+	TargetData    ScanResult
+	InitialURI    string
+	RedirectURi   string
+	PageTitle     string
+	StatusCode    string
+	ContentType   string
+	Server        string
+	ContentLength string
+	ReconInfo     []ReconInfo
+	PathResults   FuzzResultList
 }
 
 type ResponseResultList []ResponseResult
@@ -40,19 +52,18 @@ type HeaderPurpose struct {
 }
 
 type HeaderConfig struct {
-	WebServer []HeaderPurpose `json:"web_server"`
-	FrameworkRuntime []HeaderPurpose `json:"framework_runtime"`
-	CMS []HeaderPurpose `json:"cms"`
-	EnterpriseBusinessApps []HeaderPurpose `json:"enterprise_business_apps"`
+	WebServer                 []HeaderPurpose `json:"web_server"`
+	FrameworkRuntime          []HeaderPurpose `json:"framework_runtime"`
+	CMS                       []HeaderPurpose `json:"cms"`
+	EnterpriseBusinessApps    []HeaderPurpose `json:"enterprise_business_apps"`
 	AnalyticsMarketingTesting []HeaderPurpose `json:"analytics_marketing_testing"`
-	CulturalMisc []HeaderPurpose `json:"cultural_misc"`
-	WafSecurity []HeaderPurpose `json:"waf_security"`
-	CDNReverseProxyCloud []HeaderPurpose `json:"cdn_reverse_proxy_cloud"`
-	CacheOptimization []HeaderPurpose `json:"cache_optimization"`
-	HostingPlatform []HeaderPurpose `json:"hosting_platform"`
-	ApplicationInternal []HeaderPurpose `json:"application_internal"`
+	CulturalMisc              []HeaderPurpose `json:"cultural_misc"`
+	WafSecurity               []HeaderPurpose `json:"waf_security"`
+	CDNReverseProxyCloud      []HeaderPurpose `json:"cdn_reverse_proxy_cloud"`
+	CacheOptimization         []HeaderPurpose `json:"cache_optimization"`
+	HostingPlatform           []HeaderPurpose `json:"hosting_platform"`
+	ApplicationInternal       []HeaderPurpose `json:"application_internal"`
 }
-
 
 type ProgressBar struct {
 	Total     int
