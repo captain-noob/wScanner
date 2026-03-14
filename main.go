@@ -1,35 +1,34 @@
 package main
 
 import (
- "bufio"
- "crypto/tls"
-  "flag"
-  "fmt"
- "io"
- "encoding/json"
- "math/rand"
-"net"
- "net/http"
-  "os"
- "os/exec"
- "regexp"
- "runtime"
- "strconv"
- "strings"
- "sync"
-  "time"
-  "reflect"
-  "os/user"
+	"bufio"
+	"crypto/tls"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
+	"net/http"
+	"os"
+	"os/user"
+	"reflect"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 const (
-    Reset  = "\033[0m"
-    Red    = "\033[31m"
-    Green  = "\033[32m"
-    Yellow = "\033[33m"
-    Blue   = "\033[34m"
-    Cyan   = "\033[36m"
-    Bold   = "\033[1m"
+	Reset  = "\033[0m"
+	Red    = "\033[31m"
+	Green  = "\033[32m"
+	Yellow = "\033[33m"
+	Blue   = "\033[34m"
+	Cyan   = "\033[36m"
+	Bold   = "\033[1m"
 )
 
 const version = "beta-v2.0.0"
@@ -37,6 +36,7 @@ const version = "beta-v2.0.0"
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
 const remotePorts = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/ports.txt"
+
 // const remoteWappalyzer = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/wappalyzer.json"
 
 var folderName = "wScanner_" + time.Now().Format("20060102_150405")
@@ -44,15 +44,16 @@ var folderName = "wScanner_" + time.Now().Format("20060102_150405")
 var isProgressBarCompleted = false
 
 var (
-portsFile = flag.String("ports-file", "ports.txt", "File containing **newline-separated ports** to probe.")
-inputFile = flag.String("input", "", "File containing **newline-separated hostnames or IP addresses** to scan.")
-host = flag.String("host", "", "Single **hostname or IP address** to scan (alternative to -input).")
-verbose = flag.Bool("v", false, "Enable **verbose** output mode.")
-time_out = flag.Int("timeout", 15, "Timeout duration in **seconds** for each probe/request.")
-stdout = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
-local = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
-updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
-maxRPS = flag.Int("rps", 0,"Maximum cuncurrent requests per second (global)")
+	portsFile    = flag.String("ports-file", "ports.txt", "File containing **newline-separated ports** to probe.")
+	inputFile    = flag.String("input", "", "File containing **newline-separated hostnames or IP addresses** to scan.")
+	host         = flag.String("host", "", "Single **hostname or IP address** to scan (alternative to -input).")
+	verbose      = flag.Bool("v", false, "Enable **verbose** output mode.")
+	time_out     = flag.Int("timeout", 15, "Timeout duration in **seconds** for each probe/request.")
+	stdout       = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
+	local        = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
+	updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
+	maxRPS       = flag.Int("rps", 0, "Maximum cuncurrent requests per second (global)")
+
 // csvOut = flag.String("out", "results.csv", "CSV output file")
 // randomUA = flag.Bool("random-ua", true, "enable random User-Agent selection")
 // proxy = flag.String("proxy", "", "single HTTP proxy to use (eg http://127.0.0.1:8080)")
@@ -64,32 +65,58 @@ maxRPS = flag.Int("rps", 0,"Maximum cuncurrent requests per second (global)")
 // wappalyzerDB = flag.String("wappalyzer", "wappalyzer.json", "local Wappalyzer-like json dataset to detect technologies")
 )
 
-
 // CSV columns
 var csvHeaders = []string{
-"target",
-"port",
-"scheme",
-"status_code",
-"content_length",
-"content_type",
-"redirect_location",
-"favicon_mmh3",
-"response_time_ms",
-"body_line_count",
-"body_word_count",
-"page_title",
-"server",
-"technologies",
-"http_method",
-"websocket_capable",
-"ip",
-"asn",
-"cdn_waf",
+	"target",
+	"port",
+	"scheme",
+	"status_code",
+	"content_length",
+	"content_type",
+	"redirect_location",
+	"favicon_mmh3",
+	"response_time_ms",
+	"body_line_count",
+	"body_word_count",
+	"page_title",
+	"server",
+	"technologies",
+	"http_method",
+	"websocket_capable",
+	"ip",
+	"asn",
+	"cdn_waf",
 }
 
 var userAgentsFile *string
 var headersFile *string
+
+// --- Cached data (loaded once at startup) ---
+var cachedUserAgents []string
+var cachedHeaderConfig HeaderConfig
+
+// loadCaches reads user-agent and headers files once into memory.
+// Must be called after checkAndDownloadAssets() sets the file paths.
+func loadCaches() {
+	// Cache user agents (Perf #9)
+	agents, err := readInputFile(*userAgentsFile)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not load user-agent file: %v (will use default UA)\n", Yellow, Reset, err)
+	} else {
+		cachedUserAgents = agents
+	}
+
+	// Cache header config (Bug #6)
+	rawJSON, err := readInputFile(*headersFile)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not load headers file: %v\n", Yellow, Reset, err)
+		return
+	}
+	headersData := []byte(strings.Join(rawJSON, "\n"))
+	if err := json.Unmarshal(headersData, &cachedHeaderConfig); err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not parse headers JSON: %v\n", Yellow, Reset, err)
+	}
+}
 
 func downloadFile(url string, filepath string) error {
 	resp, err := http.Get(url)
@@ -111,7 +138,7 @@ func downloadFile(url string, filepath string) error {
 func checkAndDownloadAssets() bool {
 	currentUser, _ := user.Current()
 	homeDir := currentUser.HomeDir
-	assetDir := homeDir + string(os.PathSeparator) + ".config" + string(os.PathSeparator) + "wScanner" + string(os.PathSeparator) 
+	assetDir := homeDir + string(os.PathSeparator) + ".config" + string(os.PathSeparator) + "wScanner" + string(os.PathSeparator)
 	if _, err := os.Stat(assetDir); os.IsNotExist(err) {
 		err := os.MkdirAll(assetDir, 0755)
 		if err != nil {
@@ -149,9 +176,12 @@ func checkAndDownloadAssets() bool {
 		}
 	}
 
-	portsFile = &portsPath
-	userAgentsFile = &uaPath
-	headersFile = &headersPath
+	pPath := portsPath
+	portsFile = &pPath
+	uPath := uaPath
+	userAgentsFile = &uPath
+	hPath := headersPath
+	headersFile = &hPath
 
 	return true
 }
@@ -173,7 +203,6 @@ func StartSpinner(stopChan chan bool) {
 	}
 }
 
-
 func NewProgressBar(total int) *ProgressBar {
 	const defaultWidth = 60
 	return &ProgressBar{
@@ -188,12 +217,12 @@ func NewProgressBar(total int) *ProgressBar {
 
 // Update increments the progress bar safely and prints the new state.
 func (pb *ProgressBar) Update(step int) {
-    // 1. Lock the Mutex before modifying shared state (Current)
-    pb.Mux.Lock()
-    // 2. Ensure the Mutex is unlocked when the function exits, regardless of how it exits
-    defer pb.Mux.Unlock()
+	// 1. Lock the Mutex before modifying shared state (Current)
+	pb.Mux.Lock()
+	// 2. Ensure the Mutex is unlocked when the function exits, regardless of how it exits
+	defer pb.Mux.Unlock()
 
-    // Now, only one goroutine can execute the following code block at a time
+	// Now, only one goroutine can execute the following code block at a time
 
 	pb.Current += step
 	isProgressBarCompleted = false
@@ -208,11 +237,11 @@ func (pb *ProgressBar) Update(step int) {
 	emptyPart := strings.Repeat(pb.EmptyChar, pb.Width-filledWidth)
 
 	// Note: We use fmt.Fprint(os.Stdout, ...) or just fmt.Print here.
-    // Console output for the progress bar itself is inherently tricky in concurrent contexts,
-    // as multiple goroutines could try to print to the screen simultaneously.
-    // However, the mutex ensures the *data calculation* is safe.
-    // If you see garbled output, you may need a global lock around ALL printing too.
-    // For this simple case, locking the Update function is usually sufficient.
+	// Console output for the progress bar itself is inherently tricky in concurrent contexts,
+	// as multiple goroutines could try to print to the screen simultaneously.
+	// However, the mutex ensures the *data calculation* is safe.
+	// If you see garbled output, you may need a global lock around ALL printing too.
+	// For this simple case, locking the Update function is usually sufficient.
 	output := fmt.Sprintf("\r\tProgress: [%s%s] %.2f%% (%d/%d)",
 		filledPart,
 		emptyPart,
@@ -228,7 +257,6 @@ func (pb *ProgressBar) Update(step int) {
 		isProgressBarCompleted = true
 	}
 }
-
 
 func CheckInternet() bool {
 	timeout := 3 * time.Second
@@ -253,14 +281,11 @@ func readInputFile(filePath string) ([]string, error) {
 }
 
 func getRandomUserAgent() string {
-	userAgents, err := readInputFile(*userAgentsFile)
-	if err != nil || len(userAgents) == 0 {
+	if len(cachedUserAgents) == 0 {
 		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36"
 	}
-	rand.Seed(time.Now().UnixNano())
-	return userAgents[rand.Intn(len(userAgents))]
+	return cachedUserAgents[rand.Intn(len(cachedUserAgents))]
 }
-
 
 func getMaxThreads() int {
 	numCPU := runtime.NumCPU()
@@ -269,24 +294,16 @@ func getMaxThreads() int {
 }
 
 func getConcurrencyLimit() int {
-	cmd := exec.Command("bash", "-c", "ulimit -n")
-	output, err := cmd.Output()	
-	if err != nil {
-		fmt.Printf("Error getting ulimit: %v\n", err)
-		return 100
+	// Cross-platform: derive from CPU count instead of bash ulimit
+	limit := runtime.NumCPU() * 256
+	if limit > 1024 {
+		limit = 1024
 	}
-
-	ulimitStr := strings.TrimSpace(string(output))
-	ulimit, err := strconv.Atoi(ulimitStr)
-	if err != nil {
-		fmt.Printf("Error parsing ulimit: %v\n", err)
-		return 100
+	if limit < 100 {
+		limit = 100
 	}
-
-	return ulimit
+	return limit
 }
-
-
 
 func detectScheme(host string, port string) string {
 	address := net.JoinHostPort(host, port)
@@ -322,9 +339,9 @@ func checkForOpenPort(host string, port string) bool {
 	address := net.JoinHostPort(host, port)
 	timeout := time.Duration(*time_out) * time.Second
 	dialer := &net.Dialer{
-        Timeout: timeout,
-    }
-	conn, err := dialer.Dial("tcp", address )
+		Timeout: timeout,
+	}
+	conn, err := dialer.Dial("tcp", address)
 	if err != nil {
 		return false
 	}
@@ -335,17 +352,19 @@ func checkForOpenPort(host string, port string) bool {
 func probePorts(target string, ports []string) ScanResultList {
 	totalPorts := len(ports)
 
-    bar := NewProgressBar(totalPorts)
+	bar := NewProgressBar(totalPorts)
 
 	// We use the full length of ports for the channel buffer size
 	jobs := make(chan string, totalPorts)
-	results := make(chan string, totalPorts)
+	results := make(chan ScanResult, totalPorts) // Perf #7: results now carry scheme
 
 	var wg sync.WaitGroup
-	
-	// TUNE THIS: Concurrency Limit (You had 1000, 200 is often a safer starting point)
-	workerCount := 0
-	if len(ports) < 300 { workerCount = len(ports) } else { workerCount = 300 }
+
+	// Concurrency Limit
+	workerCount := 300
+	if len(ports) < workerCount {
+		workerCount = len(ports)
+	}
 
 	concurrencyLimit := getConcurrencyLimit()
 	if workerCount > concurrencyLimit {
@@ -356,23 +375,20 @@ func probePorts(target string, ports []string) ScanResultList {
 		workerCount = totalPorts
 	}
 
-	// if *maxRPS != nil && *maxRPS > 0 && workerCount > *maxRPS {
-	// 	workerCount = *maxRPS
-	// }
-
 	// 1. Start Workers
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for port := range jobs {
-				
-				// The fixed probePorts now passes the timeout duration
 				if checkForOpenPort(target, port) {
-					
-					// fmt.Printf("\r [%s] Probing for open ports ... \r", time.Now().Format("15:04:05"))
-					results <- port
-				} else if *verbose { // Using the global 'verbose' for output
+					// Perf #7: detect scheme inside worker goroutine
+					results <- ScanResult{
+						IP:     target,
+						Port:   port,
+						Scheme: detectScheme(target, port),
+					}
+				} else if *verbose {
 					fmt.Printf("Port %s is closed on %s\n", port, target)
 				}
 				bar.Update(1)
@@ -393,93 +409,71 @@ func probePorts(target string, ports []string) ScanResultList {
 	}()
 
 	// 4. Collect Results (Main Thread)
-	// var openPorts []string
 	var openPorts ScanResultList
 	for r := range results {
-		openPorts = append(openPorts, ScanResult{
-			IP:     target,
-			Port:   r,
-			Scheme: detectScheme(target, r),
-		})
+		openPorts = append(openPorts, r)
 	}
-
-    // stop <- true
 
 	return openPorts
 }
 
-
-func probeTargets(targets []string, ports []string) ScanResultList{
+func probeTargets(targets []string, ports []string) ScanResultList {
 	totalIps := len(targets)
 	totalPorts := len(ports)
 
-    
-
 	maxtotalJobs := totalIps * totalPorts
-
 
 	maxWorkers := getConcurrencyLimit()
 	if maxtotalJobs < maxWorkers {
 		maxWorkers = maxtotalJobs
 	}
 
-    
-	
-
-    
-
-
 	type targetItem struct {
-		IP      string 
-		Port    string    
+		IP   string
+		Port string
 	}
 
-
 	jobs := make(chan targetItem, maxtotalJobs)
-	results := make(chan targetItem, maxtotalJobs)
+	results := make(chan ScanResult, maxtotalJobs) // Perf #7: carry scheme in result
 
 	var wg sync.WaitGroup
-	
+
 	workerCount := maxWorkers
 
-	if  *maxRPS > 0 && workerCount < *maxRPS {
+	// Bug #3: RPS should LIMIT concurrency, not increase it
+	if *maxRPS > 0 && workerCount > *maxRPS {
 		workerCount = *maxRPS
 	}
 
 	fmt.Printf("%s[*]%s Setting concurrency limit to: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
-	
+
 	bar := NewProgressBar(maxtotalJobs)
-	currentJob := 0
 
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for itemX := range jobs {
-				
 				if checkForOpenPort(itemX.IP, itemX.Port) {
-					results <- itemX
-				} else if *verbose { // Using the global 'verbose' for output
+					// Perf #7: detect scheme inside worker goroutine
+					results <- ScanResult{
+						IP:     itemX.IP,
+						Port:   itemX.Port,
+						Scheme: detectScheme(itemX.IP, itemX.Port),
+					}
+				} else if *verbose {
 					fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
 				}
-				currentJob++
 				bar.Update(1)
 			}
 		}()
 	}
 
-	
 	for _, target := range targets {
-		// 2. Send Jobs
 		for _, port := range ports {
-			targetItem := targetItem{
-				IP:   target,
-				Port: port,
-			}
-			jobs <- targetItem
+			jobs <- targetItem{IP: target, Port: port}
 		}
 	}
-
 
 	close(jobs)
 
@@ -489,37 +483,28 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 	}()
 
 	var openPorts ScanResultList
-	
+
 	fname := folderName + "/open_ports_initial.txt"
 	file, err := os.Create(fname)
 	if err != nil {
 		fmt.Printf("%s[!] Error:%s Failed to create open ports file: %v\n", Red, Reset, err)
 	}
-	
-	
-	
 
 	for r := range results {
-		// fmt.Printf("%d",)
-
-		if isProgressBarCompleted{
+		if isProgressBarCompleted {
 			fmt.Printf("\r%s%s [*] %sWaiting for all goroutines to complete: %s[%d] left%s   ",
-				Cyan, Bold,   // [*] style
-				Reset,        // Reset text color for the message
-				Red,          // Style for the number
-				len(results), // The remaining count
-				Reset,        // Always reset at the end
+				Cyan, Bold,
+				Reset,
+				Red,
+				len(results),
+				Reset,
 			)
 		}
 		if file != nil {
 			line := fmt.Sprintf("%s:%s\n", r.IP, r.Port)
 			file.WriteString(line)
 		}
-		openPorts = append(openPorts, ScanResult{
-			IP:     r.IP,
-			Port:   r.Port,
-			Scheme: detectScheme(r.IP, r.Port),
-		})
+		openPorts = append(openPorts, r)
 	}
 
 	if file != nil {
@@ -531,89 +516,65 @@ func probeTargets(targets []string, ports []string) ScanResultList{
 	return openPorts
 }
 
-
-
 func getResponse(item ScanResult) ResponseResult {
 	var outx ResponseResult
 
 	outx.TargetData = item
 
-    if len(item.Scheme) < 1 {
-        return outx
-    }
+	if len(item.Scheme) < 1 {
+		return outx
+	}
 
-    InitialURI := fmt.Sprintf("%s://%s:%s", item.Scheme, item.IP, item.Port)
-    
-    tr := &http.Transport{
-        TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-    }
+	InitialURI := fmt.Sprintf("%s://%s:%s", item.Scheme, item.IP, item.Port)
 
-    client := &http.Client{
-        Transport: tr,
-        Timeout: time.Duration(*time_out) * time.Second,
-    }
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
 
-    req, err := http.NewRequest("GET", InitialURI, nil)
-    if err != nil {
-        return outx
-    }
-    req.Header.Set("User-Agent", getRandomUserAgent())
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   time.Duration(*time_out) * time.Second,
+	}
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return outx
-    }
+	req, err := http.NewRequest("GET", InitialURI, nil)
+	if err != nil {
+		return outx
+	}
+	req.Header.Set("User-Agent", getRandomUserAgent())
 
-    defer resp.Body.Close()
-    
-    targetRedirect := ""
-	if resp.Request.URL.String() != ""{
+	resp, err := client.Do(req)
+	if err != nil {
+		return outx
+	}
+
+	defer resp.Body.Close()
+
+	targetRedirect := ""
+	if resp.Request.URL.String() != "" {
 		targetRedirect = resp.Request.URL.String()
 	}
 
-    
-    
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return outx
-    }
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return outx
+	}
 
-    re := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
+	re := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
 	page_title := ""
-    matches := re.FindStringSubmatch(string(body))
-    if len(matches) > 1 {
-        page_title = matches[1]
-    }
-
-	
-
-
-	raw_json, err := readInputFile(*headersFile)
-	headersData := []byte(strings.Join(raw_json, "\n"))
-	if err != nil {
-		fmt.Printf("Error reading headers file: %v\n", err)
-		return outx
+	matches := re.FindStringSubmatch(string(body))
+	if len(matches) > 1 {
+		page_title = matches[1]
 	}
 
-	var config HeaderConfig
-	err = json.Unmarshal(headersData, &config)
-	if err != nil {
-		fmt.Printf("Error parsing JSON: %v\n", err)
-		return outx
-	}
-
-	v := reflect.ValueOf(config)
+	// Bug #6: Use cached header config instead of re-reading file on every response
+	v := reflect.ValueOf(cachedHeaderConfig)
 	t := v.Type()
-
-
 
 	// foundAny := false
 
 	for i := 0; i < v.NumField(); i++ {
 
 		var recx ReconInfo
-
-		
 
 		field := v.Field(i)
 
@@ -633,20 +594,17 @@ func getResponse(item ScanResult) ResponseResult {
 		} else if t.Field(i).Name == "ApplicationInternal" {
 			CategoryName = "Internal / Application Metadata"
 		} else if t.Field(i).Name == "CMS" {
-            CategoryName = "CMS"
-        } else if t.Field(i).Name == "EnterpriseBusinessApps" {
-            CategoryName = "Enterprise / Business Apps"
-        } else if t.Field(i).Name == "AnalyticsMarketingTesting" {
-            CategoryName = "Analytics / Marketing / Testing"
-        } else if t.Field(i).Name == "CulturalMisc" {
-            CategoryName = "Cultural / Misc"
-        }
+			CategoryName = "CMS"
+		} else if t.Field(i).Name == "EnterpriseBusinessApps" {
+			CategoryName = "Enterprise / Business Apps"
+		} else if t.Field(i).Name == "AnalyticsMarketingTesting" {
+			CategoryName = "Analytics / Marketing / Testing"
+		} else if t.Field(i).Name == "CulturalMisc" {
+			CategoryName = "Cultural / Misc"
+		}
 
 		recx.CategoryID = t.Field(i).Name
 		recx.CategoryName = CategoryName
-
-
-
 
 		// Ensure the field is a slice (which they all are in your struct)
 		if field.Kind() == reflect.Slice {
@@ -677,45 +635,51 @@ func getResponse(item ScanResult) ResponseResult {
 	return outx
 }
 
-
 func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 	var wg sync.WaitGroup
 
-	// jobs := make(chan ScanResult, len(openPorts))
-	results := make(chan ResponseResult, len(openPorts)) 
+	// Perf #8: Use a capped worker pool instead of unbounded goroutines
+	jobs := make(chan ScanResult, len(openPorts))
+	results := make(chan ResponseResult, len(openPorts))
 
 	bar := NewProgressBar(len(openPorts))
 
-	
-	
-
-	for _, port := range openPorts {
-		wg.Add(1)
-		
-
-		go func(p ScanResult) { // pass as value to avoid loop variable capture
-			defer wg.Done()
-			// fmt.Printf("\r [%s] Probing Headers ... \r", time.Now().Format("15:04:05"))
-			x := getResponse(p)
-			results <- x
-			bar.Update(1)
-		}(port)
+	workerCount := getConcurrencyLimit()
+	if len(openPorts) < workerCount {
+		workerCount = len(openPorts)
 	}
 
-	// Close channel once all goroutines finish
+	// Start fixed number of workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				x := getResponse(p)
+				results <- x
+				bar.Update(1)
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, port := range openPorts {
+		jobs <- port
+	}
+	close(jobs)
+
+	// Close channel once all workers finish
 	go func() {
-		
 		wg.Wait()
 		close(results)
 	}()
 
-	// Read concurrent results
-	
+	// Collect results
 	resp := ResponseResultList{}
 	for r := range results {
 		resp = append(resp, r)
 	}
-	
+
 	return resp
 }
 
@@ -728,66 +692,66 @@ func createOutputFolder() bool {
 }
 
 func SaveReport(results ResponseResultList) (string, error) {
-    
-    
 
+	html, err := GenerateHTMLReport(results)
+	if err != nil {
+		return "", err
+	}
 
-    html, err := GenerateHTMLReport(results)
-    if err != nil {
-        return "", err
-    }
+	fname := folderName + "/output_report.html"
+	if err := os.WriteFile(fname, []byte(html), 0644); err != nil {
+		return "", err
+	}
 
-    fname := folderName + "/output_report.html"
-    if err := os.WriteFile(fname, []byte(html), 0644); err != nil {
-        return "", err
-    }
+	fnameTxt := folderName + "/output_urls.txt"
+	file, err := os.Create(fnameTxt)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
 
-    fnameTxt := folderName + "/output_urls.txt"
-    file, err := os.Create(fnameTxt)
-    if err != nil {
-        return "", err
-    }
-    defer file.Close()
+	writer := bufio.NewWriter(file)
+	for _, x := range results {
+		if len(x.TargetData.Scheme) < 1 {
+			continue
+		}
+		p := x.TargetData
+		line := fmt.Sprintf("%s://%s:%s\n", p.Scheme, p.IP, p.Port)
+		writer.WriteString(line)
+	}
 
-    writer := bufio.NewWriter(file)
-    for _, x := range results {
-        if len(x.TargetData.Scheme) < 1 {
-            continue
-        }
-        p := x.TargetData
-        line := fmt.Sprintf("%s://%s:%s\n", p.Scheme, p.IP, p.Port)
-        writer.WriteString(line)
-    }
+	writer.Flush()
 
-    writer.Flush()
-
-    return folderName, nil
+	return folderName, nil
 }
 
-
 func printStdout(results ResponseResultList) {
-    fmt.Printf("\n%s=== SCAN RESULTS ===%s\n", Bold, Reset)
-    for _, x := range results {
+	fmt.Printf("\n%s=== SCAN RESULTS ===%s\n", Bold, Reset)
+	for _, x := range results {
 		p := x.TargetData
-		
+
 		// Colorize Status Code (Green 2xx, Yellow 3xx, Red 4xx/5xx)
 		statusColor := Green
 		if len(x.StatusCode) > 0 {
-			if x.StatusCode[0] == '3' { statusColor = Yellow }
-			if x.StatusCode[0] == '4' || x.StatusCode[0] == '5' { statusColor = Red }
+			if x.StatusCode[0] == '3' {
+				statusColor = Yellow
+			}
+			if x.StatusCode[0] == '4' || x.StatusCode[0] == '5' {
+				statusColor = Red
+			}
 		}
 
 		fmt.Println("------------------------------------------------------------")
 		fmt.Printf("%s➤ TARGET:%s %s://%s:%s\n", Cyan, Reset, p.Scheme, p.IP, p.Port)
 		fmt.Println("------------------------------------------------------------")
-		
+
 		fmt.Printf(" %s• Title         :%s %s\n", Bold, Reset, x.PageTitle)
 		fmt.Printf(" %s• Status Code   :%s %s%s%s\n", Bold, Reset, statusColor, x.StatusCode, Reset)
 		fmt.Printf(" %s• Server        :%s %s\n", Bold, Reset, x.Server)
 		fmt.Printf(" %s• Content Type  :%s %s\n", Bold, Reset, x.ContentType)
 		fmt.Printf(" %s• Content Len   :%s %s\n", Bold, Reset, x.ContentLength)
 		fmt.Printf(" %s• Initial URI   :%s %s\n", Bold, Reset, x.InitialURI)
-		
+
 		if x.RedirectURi != "" {
 			fmt.Printf(" %s• Redirect URI  :%s %s\n", Yellow, Reset, x.RedirectURi)
 		}
@@ -795,11 +759,11 @@ func printStdout(results ResponseResultList) {
 		if len(x.ReconInfo) > 0 {
 			fmt.Printf("\n %s[ Recon Information ]%s\n", Yellow, Reset)
 			for _, info := range x.ReconInfo {
-				fmt.Printf("   %s+%s [%s] %s: %s%s%s (%s)\n", 
-					Red, Reset, 
-					info.CategoryName, 
-					info.HeaderName, 
-					Cyan, info.HeaderValue, Reset, 
+				fmt.Printf("   %s+%s [%s] %s: %s%s%s (%s)\n",
+					Red, Reset,
+					info.CategoryName,
+					info.HeaderName,
+					Cyan, info.HeaderValue, Reset,
 					info.Purpose,
 				)
 			}
@@ -808,15 +772,10 @@ func printStdout(results ResponseResultList) {
 	}
 }
 
-
-
-
-
 func main() {
 	// --- ANSI Color Definitions for "Cool" Output ---
-    fmt.Println()
+	fmt.Println()
 
-    
 	fmt.Println("wScanner - Web Port Scanner")
 
 	// Custom Usage Message
@@ -828,17 +787,14 @@ func main() {
 
 	flag.Parse()
 
-
-
 	// --- Input Validation ---
 	if flag.NFlag() == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-
 	// Banner / Internet Check
-	
+
 	if CheckInternet() {
 		fmt.Printf("%s[+] Internet Connection:%s %sONLINE%s\n", Green, Reset, Bold, Reset)
 	} else {
@@ -854,8 +810,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// os.Exit(1)
+	// Load caches once at startup (Bug #6, Perf #9)
+	loadCaches()
 
+	// os.Exit(1)
 
 	if *inputFile != "" && *host != "" {
 		fmt.Printf("%s[!] Error:%s Please provide only one of -input or -host\n", Red, Reset)
@@ -881,13 +839,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	
-	
-	
-
 	// --- Scanning Phase ---
 	var probeResults ResponseResultList
-	var openPorts ScanResultList 
+	var openPorts ScanResultList
 
 	if *inputFile != "" {
 		targets, err := readInputFile(*inputFile)
@@ -909,8 +863,8 @@ func main() {
 
 	// --- Results Display ---
 	if *stdout {
-	    printStdout(probeResults)
-    }
+		printStdout(probeResults)
+	}
 
 	// --- Report Saving ---
 	reportFile, err := SaveReport(probeResults)
