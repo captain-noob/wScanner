@@ -40,7 +40,7 @@ fi
 
 # --- Versioning Setup ---
 # Attempt to get Git version information, otherwise use a default
-VERSION="beta-v2.0.0"
+VERSION="beta-v4.0.0"
 BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 echo "Building version: $VERSION (Date: $BUILD_DATE)"
