@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/user"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -60,6 +61,7 @@ var (
 	outputDir    = flag.String("output", "", "Custom **output folder** name (default: wScanner_YYYYMMDD_HHMMSS).")
 	csvOut       = flag.Bool("csv", false, "Generate a **CSV** results file in the output folder.")
 	pathFile     = flag.String("path", "", "Custom **wordlist** file for directory/path fuzzing.")
+	selfUpdate   = flag.Bool("update", false, "Self-update wScanner to the **latest** GitHub release.")
 )
 
 // CSV columns
@@ -309,6 +311,10 @@ func getMaxThreads() int {
 }
 
 func getConcurrencyLimit() int {
+	// If user specified -rps, honour it as the concurrency limit (no cap).
+	if *maxRPS > 0 {
+		return *maxRPS
+	}
 	// Cross-platform: derive from CPU count instead of bash ulimit
 	limit := runtime.NumCPU() * 256
 	if limit > 1024 {
@@ -455,11 +461,6 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 	var wg sync.WaitGroup
 
 	workerCount := maxWorkers
-
-	// Bug #3: RPS should LIMIT concurrency, not increase it
-	if *maxRPS > 0 && workerCount > *maxRPS {
-		workerCount = *maxRPS
-	}
 
 	fmt.Printf("%s[*]%s Setting concurrency limit to: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
 
@@ -1176,6 +1177,163 @@ func printStdout(results ResponseResultList) {
 	}
 }
 
+// --- Self-Update Logic ---
+
+// ghRelease mirrors the subset of the GitHub releases/latest JSON we need.
+type ghRelease struct {
+	TagName string    `json:"tag_name"`
+	Assets  []ghAsset `json:"assets"`
+}
+
+type ghAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+func runSelfUpdate() {
+	// 1. Resolve the installed binary path.
+	exePath, err := os.Executable()
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s Could not determine executable path: %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+	exePath, err = filepath.EvalSymlinks(exePath)
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s Could not resolve symlinks: %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%s[*]%s Installed binary : %s%s%s\n", Cyan, Reset, Bold, exePath, Reset)
+	fmt.Printf("%s[*]%s Current version  : %s%s%s\n", Cyan, Reset, Bold, version, Reset)
+	fmt.Printf("%s[*]%s Platform        : %s%s/%s%s\n", Cyan, Reset, Bold, runtime.GOOS, runtime.GOARCH, Reset)
+
+	// 2. Fetch latest release metadata from GitHub.
+	const apiURL = "https://api.github.com/repos/captain-noob/wScanner/releases/latest"
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s Could not reach GitHub API: %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		fmt.Printf("%s[!] Error:%s GitHub API returned status %d\n", Red, Reset, resp.StatusCode)
+		os.Exit(1)
+	}
+
+	var release ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		fmt.Printf("%s[!] Error:%s Failed to parse release JSON: %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%s[*]%s Latest release   : %s%s%s\n", Cyan, Reset, Bold, release.TagName, Reset)
+
+	// 3. Check if already up to date.
+	//    The tag may or may not contain the full version string; do a contains check.
+	if strings.Contains(release.TagName, version) || strings.Contains(version, release.TagName) {
+		fmt.Printf("%s[✓] Already up to date!%s\n", Green, Reset)
+		return
+	}
+
+	// 4. Find the matching asset for this OS/ARCH.
+	needle := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	var downloadURL string
+	var assetName string
+	for _, a := range release.Assets {
+		if strings.Contains(a.Name, needle) {
+			downloadURL = a.BrowserDownloadURL
+			assetName = a.Name
+			break
+		}
+	}
+
+	if downloadURL == "" {
+		fmt.Printf("%s[!] Error:%s No release asset found for %s/%s\n", Red, Reset, runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("    Available assets:\n")
+		for _, a := range release.Assets {
+			fmt.Printf("      - %s\n", a.Name)
+		}
+		os.Exit(1)
+	}
+
+	fmt.Printf("%s[+]%s Downloading %s%s%s ...\n", Cyan, Reset, Bold, assetName, Reset)
+
+	// 5. Download the asset to a temp file in the same directory.
+	dlResp, err := http.Get(downloadURL)
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s Download failed: %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		fmt.Printf("%s[!] Error:%s Download returned status %d\n", Red, Reset, dlResp.StatusCode)
+		os.Exit(1)
+	}
+
+	// Write to temp file in the same dir so rename works (same filesystem).
+	tmpPath := exePath + ".tmp"
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		fmt.Printf("%s[!] Error:%s Could not create temp file: %v\n", Red, Reset, err)
+		fmt.Printf("    (Hint: you may need to run with elevated privileges)\n")
+		os.Exit(1)
+	}
+
+	_, err = io.Copy(tmpFile, dlResp.Body)
+	tmpFile.Close()
+	if err != nil {
+		os.Remove(tmpPath)
+		fmt.Printf("%s[!] Error:%s Failed to write downloaded binary: %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+
+	// 6. Replace the installed binary.
+	if runtime.GOOS == "windows" {
+		// Windows locks the running executable, so rename-away first.
+		oldPath := exePath + ".old"
+		os.Remove(oldPath) // remove stale .old if present
+		if err := os.Rename(exePath, oldPath); err != nil {
+			os.Remove(tmpPath)
+			fmt.Printf("%s[!] Error:%s Could not rename old binary: %v\n", Red, Reset, err)
+			os.Exit(1)
+		}
+		if err := os.Rename(tmpPath, exePath); err != nil {
+			// Attempt rollback
+			os.Rename(oldPath, exePath)
+			os.Remove(tmpPath)
+			fmt.Printf("%s[!] Error:%s Could not install new binary: %v\n", Red, Reset, err)
+			os.Exit(1)
+		}
+		os.Remove(oldPath)
+	} else {
+		// Unix: set executable bit, then atomic rename.
+		if err := os.Chmod(tmpPath, 0755); err != nil {
+			os.Remove(tmpPath)
+			fmt.Printf("%s[!] Error:%s Could not set permissions: %v\n", Red, Reset, err)
+			os.Exit(1)
+		}
+		if err := os.Rename(tmpPath, exePath); err != nil {
+			os.Remove(tmpPath)
+			fmt.Printf("%s[!] Error:%s Could not replace binary: %v\n", Red, Reset, err)
+			fmt.Printf("    (Hint: try running with sudo)\n")
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("%s[✓] Updated successfully!%s  %s → %s\n", Green, Reset, version, release.TagName)
+}
+
 func main() {
 	// --- ANSI Color Definitions for "Cool" Output ---
 	fmt.Println()
@@ -1190,6 +1348,12 @@ func main() {
 	}
 
 	flag.Parse()
+
+	// --- Self-Update ---
+	if *selfUpdate {
+		runSelfUpdate()
+		os.Exit(0)
+	}
 
 	// --- Input Validation ---
 	if flag.NFlag() == 0 {

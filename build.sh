@@ -20,6 +20,8 @@ TARGETS=(
     "linux/arm64"    # Raspberry Pi 5 Linux (ARM)
     "darwin/amd64"   # macOS (Intel/x64 - Older Macs or non-Apple Silicon)
     "darwin/arm64"   # macOS (Apple Silicon / M1, M2, M3 chips - ARM)
+    "windows/amd64"  # Windows 64-bit
+    "windows/arm64"  # Windows ARM64
 )
 
 # --- Setup and Validation ---
@@ -40,7 +42,7 @@ fi
 
 # --- Versioning Setup ---
 # Attempt to get Git version information, otherwise use a default
-VERSION="beta-v4.0.0"
+VERSION="beta-v6.0.0"
 BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 echo "Building version: $VERSION (Date: $BUILD_DATE)"

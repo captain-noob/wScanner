@@ -11,6 +11,7 @@ A fast, concurrent web port scanner and HTTP reconnaissance tool written in Go.
 - **403 Bypass** — Automatically attempts 31 bypass techniques (header injection, method switching, path mutation)
 - **HTML Report** — Clean, interactive report with filtering and search
 - **CSV Export** — Machine-readable output
+- **Self-Update** — Update to the latest release directly from the CLI
 
 ## Usage
 
@@ -23,6 +24,12 @@ wScanner -input targets.txt
 
 # With options
 wScanner -host 10.0.0.1 -timeout 10 -csv -output my_scan -path custom_wordlist.txt
+
+# Increase concurrency (default auto-detected, capped at 1024)
+wScanner -input targets.txt -rps 2048
+
+# Self-update to latest release
+wScanner -update
 ```
 
 ## Flags
@@ -32,14 +39,16 @@ wScanner -host 10.0.0.1 -timeout 10 -csv -output my_scan -path custom_wordlist.t
 | `-host` | — | Single target to scan |
 | `-input` | — | File with targets (one per line) |
 | `-timeout` | `15` | Request timeout in seconds |
-| `-rps` | `0` | Max concurrent requests (0 = auto) |
+| `-rps` | `0` | Concurrency limit (0 = auto, max 1024) |
 | `-output` | auto | Custom output folder name |
 | `-csv` | `false` | Generate CSV results |
+| `-stdout` | `true` | Print results to standard output |
 | `-path` | — | Custom wordlist for directory fuzzing |
 | `-ports-file` | `ports.txt` | Custom ports file |
 | `-v` | `false` | Verbose output |
 | `-local` | `false` | Skip internet check |
 | `-update-config` | `false` | Re-download config files |
+| `-update` | `false` | Self-update to the latest GitHub release |
 
 ## Build
 
@@ -47,7 +56,9 @@ wScanner -host 10.0.0.1 -timeout 10 -csv -output my_scan -path custom_wordlist.t
 go build .
 ```
 
-Cross-compile for multiple platforms:
+Cross-compile for all platforms (Linux, macOS, Windows — amd64 & arm64):
 ```bash
 chmod +x build.sh && ./build.sh
 ```
+
+> **Note:** On Linux you can check your process limit with `ulimit -u` before running large scans.
