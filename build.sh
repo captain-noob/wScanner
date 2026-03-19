@@ -42,7 +42,7 @@ fi
 
 # --- Versioning Setup ---
 # Attempt to get Git version information, otherwise use a default
-VERSION="beta-v6.1.0"
+VERSION="beta-v6.2.0"
 BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 echo "Building version: $VERSION (Date: $BUILD_DATE)"
@@ -64,7 +64,7 @@ for TARGET in "${TARGETS[@]}"; do
     # Set the Linker Flags (-ldflags) to inject version and build info into the Go program (main package).
     # The Go program must define 'var Version string' and 'var BuildDate string' in the main package.
     # -s and -w flags remove debugging symbols and DWARF generation, reducing binary size.
-    LDFLAGS="-s -w -X main.Version=$VERSION -X main.BuildDate=$BUILD_DATE -X main.GOOS=$GOOS -X main.GOARCH=$GOARCH"
+    LDFLAGS="-s -w -X main.version=$VERSION -X main.BuildDate=$BUILD_DATE -X main.GOOS=$GOOS -X main.GOARCH=$GOARCH"
 
     # Set the environment variables for cross-compilation
     # CGO_ENABLED=0 disables the C linker (libc), making the binary statically compiled and fully self-contained.

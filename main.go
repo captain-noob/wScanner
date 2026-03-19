@@ -34,7 +34,7 @@ const (
 	Bold   = "\033[1m"
 )
 
-const version = "beta-v6.1.0"
+var version = "beta-v6.2.0"
 
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
@@ -341,23 +341,24 @@ func newRPSThrottle() (throttle func(), stop func()) {
 
 func detectScheme(host string, port string) string {
 	address := net.JoinHostPort(host, port)
+	schemeTimeout := time.Duration(*time_out) * time.Second
 
-	// --- Try HTTPS (TLS handshake) ---
+	// --- Try HTTPS first (TLS handshake) ---
 	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true, // for detection Purposes only
+		InsecureSkipVerify: true, // for detection purposes only
 	}
 
-	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	dialer := &net.Dialer{Timeout: schemeTimeout}
 
 	conn, err := tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
 	if err == nil {
 		conn.Close()
-		return "https"
+		return "https" // HTTPS valid → skip HTTP
 	}
 
-	// --- Try HTTP (simple request) ---
+	// --- Fallback: Try HTTP ---
 	client := http.Client{
-		Timeout: 2 * time.Second,
+		Timeout: schemeTimeout,
 	}
 
 	resp, err := client.Get("http://" + address)
@@ -730,6 +731,7 @@ func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 // fuzzPaths probes each discovered target with a list of paths.
 // Only keeps 2xx, 3xx, and 403 responses.
 // When a 403 is encountered, automatically tries bypass techniques.
+// Performs wildcard baseline detection to filter false positives.
 func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 	if len(paths) == 0 {
 		return results
@@ -745,6 +747,61 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 
 	if validTargets == 0 {
 		return results
+	}
+
+	// --- Wildcard Baseline Detection ---
+	// Send a canary request with a random path to each target.
+	// If it returns 200, record status + content-length as the baseline.
+	// Responses matching the baseline are likely custom 404 pages → filter them.
+	type baseline struct {
+		statusCode    int
+		contentLength int64
+	}
+	baselines := make(map[int]baseline) // keyed by result index
+
+	fmt.Printf("%s[*]%s Running wildcard baseline detection on %s%d%s targets...\n",
+		Cyan, Reset, Bold, validTargets, Reset)
+
+	baselineClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: time.Duration(*time_out) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	for idx, r := range results {
+		if len(r.TargetData.Scheme) < 1 {
+			continue
+		}
+		baseURL := fmt.Sprintf("%s://%s:%s", r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port)
+		canaryPath := fmt.Sprintf("this-path-should-never-exist-%d-%d", rand.Intn(999999), rand.Intn(999999))
+
+		req, err := http.NewRequest("GET", baseURL+"/"+canaryPath, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", getRandomUserAgent())
+
+		resp, err := baselineClient.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Only set baseline if the canary returns a "success" status (200-299)
+		// This means the target has a catch-all/custom 404 page.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			baselines[idx] = baseline{
+				statusCode:    resp.StatusCode,
+				contentLength: int64(len(body)),
+			}
+			fmt.Printf("%s  [!]%s Wildcard detected on %s%s%s (status %d, ~%d bytes) → auto-filtering\n",
+				Yellow, Reset, Bold, baseURL, Reset, resp.StatusCode, len(body))
+		}
 	}
 
 	totalJobs := validTargets * len(paths)
@@ -773,6 +830,9 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 	}
 
 	bar := NewProgressBar(totalJobs)
+
+	// Track wildcard-filtered count per target (thread-safe)
+	var filteredCount int64
 
 	// Workers
 	for i := 0; i < workerCount; i++ {
@@ -811,9 +871,34 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 					bar.Update(1)
 					continue
 				}
+
+				// Read body to get accurate content length for baseline comparison
+				body, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 
 				statusCode := resp.StatusCode
+				bodyLen := int64(len(body))
+				clHeader := resp.Header.Get("Content-Length")
+				if clHeader == "" {
+					clHeader = strconv.FormatInt(bodyLen, 10)
+				}
+
+				// --- Wildcard filter: skip if response matches baseline ---
+				if bl, ok := baselines[job.ResultIdx]; ok {
+					if statusCode == bl.statusCode {
+						// Content-length within ±10% of baseline → likely the same catch-all page
+						margin := bl.contentLength / 10
+						if margin < 50 {
+							margin = 50 // minimum margin of 50 bytes
+						}
+						if bodyLen >= bl.contentLength-margin && bodyLen <= bl.contentLength+margin {
+							atomic.AddInt64(&filteredCount, 1)
+							atomic.AddInt64(&activeGoroutines, -1)
+							bar.Update(1)
+							continue
+						}
+					}
+				}
 
 				// If 403, attempt bypass techniques
 				if statusCode == 403 {
@@ -830,7 +915,7 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 							Result: FuzzResult{
 								Path:          "/" + path,
 								StatusCode:    403,
-								ContentLength: resp.Header.Get("Content-Length"),
+								ContentLength: clHeader,
 							},
 						}
 					}
@@ -852,7 +937,7 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 						Result: FuzzResult{
 							Path:          "/" + path,
 							StatusCode:    statusCode,
-							ContentLength: resp.Header.Get("Content-Length"),
+							ContentLength: clHeader,
 							RedirectURL:   redirectURL,
 						},
 					}
@@ -893,6 +978,9 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		results[fr.ResultIdx].PathResults = append(results[fr.ResultIdx].PathResults, fr.Result)
 	}
 
+	if fc := atomic.LoadInt64(&filteredCount); fc > 0 {
+		fmt.Printf("\n%s[*]%s Wildcard filter suppressed %s%d%s false-positive responses\n", Cyan, Reset, Bold, fc, Reset)
+	}
 	fmt.Println()
 	return results
 }
