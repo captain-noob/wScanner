@@ -341,7 +341,12 @@ func newRPSThrottle() (throttle func(), stop func()) {
 
 func detectScheme(host string, port string) string {
 	address := net.JoinHostPort(host, port)
-	schemeTimeout := time.Duration(*time_out) * time.Second
+	// Use a capped per-attempt timeout of 5 seconds for scheme detection
+	schemeTimeout := 5 * time.Second
+	userTimeout := time.Duration(*time_out) * time.Second
+	if userTimeout < schemeTimeout {
+		schemeTimeout = userTimeout
+	}
 
 	// --- Try HTTPS first (TLS handshake) ---
 	tlsConfig := &tls.Config{
@@ -372,9 +377,12 @@ func detectScheme(host string, port string) string {
 
 func checkForOpenPort(host string, port string) bool {
 	address := net.JoinHostPort(host, port)
-	timeout := time.Duration(*time_out) * time.Second
+	// Use a short 3-second timeout for TCP port probing — fast but reliable.
+	// TCP SYN/ACK handshake is inherently fast; 3s is generous even for
+	// cross-continent latency while keeping thousand-port sweeps quick.
+	portTimeout := 3 * time.Second
 	dialer := &net.Dialer{
-		Timeout: timeout,
+		Timeout: portTimeout,
 	}
 	conn, err := dialer.Dial("tcp", address)
 	if err != nil {
@@ -416,9 +424,9 @@ func probePorts(target string, ports []string) ScanResultList {
 				atomic.AddInt64(&activeGoroutines, 1)
 				if checkForOpenPort(target, port) {
 					results <- ScanResult{
-						IP:     target,
-						Port:   port,
-						Scheme: detectScheme(target, port),
+						IP:   target,
+						Port: port,
+						// Scheme is detected later in detectAndFillSchemes
 					}
 				} else if *verbose {
 					fmt.Printf("Port %s is closed on %s\n", port, target)
@@ -492,9 +500,9 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 				atomic.AddInt64(&activeGoroutines, 1)
 				if checkForOpenPort(itemX.IP, itemX.Port) {
 					results <- ScanResult{
-						IP:     itemX.IP,
-						Port:   itemX.Port,
-						Scheme: detectScheme(itemX.IP, itemX.Port),
+						IP:   itemX.IP,
+						Port: itemX.Port,
+						// Scheme is detected later in detectAndFillSchemes
 					}
 				} else if *verbose {
 					fmt.Printf("Port %s is closed on %s\n", itemX.Port, itemX.IP)
@@ -561,7 +569,14 @@ func getResponse(item ScanResult) ResponseResult {
 
 	outx.TargetData = item
 
+	// If scheme is still empty, try to detect it now as a last-resort fallback
 	if len(item.Scheme) < 1 {
+		item.Scheme = detectScheme(item.IP, item.Port)
+		outx.TargetData = item
+	}
+
+	if len(item.Scheme) < 1 {
+		// Truly no HTTP/HTTPS service on this port — skip
 		return outx
 	}
 
@@ -726,6 +741,72 @@ func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 	}
 
 	return resp
+}
+
+// detectAndFillSchemes runs scheme detection concurrently on all open ports.
+// This is separated from port scanning so that port scanning stays fast (TCP-only).
+// Scheme detection (TLS handshake + HTTP GET) is only performed on the
+// relatively small number of open ports, not all ports.
+func detectAndFillSchemes(openPorts ScanResultList) ScanResultList {
+	total := len(openPorts)
+	if total == 0 {
+		return openPorts
+	}
+
+	bar := NewProgressBar(total)
+
+	type schemeJob struct {
+		Idx  int
+		Item ScanResult
+	}
+	type schemeResult struct {
+		Idx    int
+		Scheme string
+	}
+
+	jobs := make(chan schemeJob, total)
+	results := make(chan schemeResult, total)
+
+	var wg sync.WaitGroup
+
+	workerCount := getConcurrencyLimit()
+	if total < workerCount {
+		workerCount = total
+	}
+
+	fmt.Printf("%s[*]%s Scheme detection workers: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
+				scheme := detectScheme(job.Item.IP, job.Item.Port)
+				results <- schemeResult{Idx: job.Idx, Scheme: scheme}
+				atomic.AddInt64(&activeGoroutines, -1)
+				bar.Update(1)
+			}
+		}()
+	}
+
+	// Send jobs
+	for idx, item := range openPorts {
+		jobs <- schemeJob{Idx: idx, Item: item}
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and fill in schemes
+	for r := range results {
+		openPorts[r.Idx].Scheme = r.Scheme
+	}
+
+	return openPorts
 }
 
 // fuzzPaths probes each discovered target with a list of paths.
@@ -986,51 +1067,108 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 }
 
 // try403Bypass attempts multiple 403 bypass techniques on a path.
-// Returns a FuzzResult if any bypass succeeds (non-403 response in 2xx/3xx range), nil otherwise.
+// Returns a FuzzResult if any bypass succeeds (non-403 response), nil otherwise.
+// Uses its own redirect-following client to properly validate if a bypass
+// actually reaches the resource (the fuzz worker's client blocks redirects).
 func try403Bypass(client *http.Client, baseURL string, path string) *FuzzResult {
-	// --- Technique 1: Header-based bypasses ---
-	bypassHeaders := map[string]string{
-		"X-Forwarded-For":  "127.0.0.1",
-		"X-Real-IP":        "127.0.0.1",
-		"X-Originating-IP": "127.0.0.1",
-		"X-Remote-IP":      "127.0.0.1",
-		"X-Remote-Addr":    "127.0.0.1",
-		"X-ProxyUser-Ip":   "127.0.0.1",
-		"X-Original-URL":   "/" + path,
-		"X-Rewrite-URL":    "/" + path,
-		"Client-IP":        "127.0.0.1",
-		"X-Client-IP":      "127.0.0.1",
-		"X-Host":           "127.0.0.1",
-		"X-Forwarded-Host": "127.0.0.1",
+	// Create a dedicated client that FOLLOWS redirects so we can see the
+	// final status code. The fuzz worker's client has CheckRedirect =
+	// ErrUseLastResponse which would make 3xx look like bypass successes.
+	bypassClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: client.Timeout,
+		// Default redirect policy — follows up to 10 redirects
+	}
+
+	// isBypassSuccess checks if the final status is a real bypass:
+	// - Must not be 403 (the status we're trying to bypass)
+	// - Must not be other 4xx/5xx errors (those aren't useful bypasses)
+	// - 2xx = success, 3xx with Location = interesting redirect worth reporting
+	isBypassSuccess := func(statusCode int) bool {
+		return statusCode >= 200 && statusCode < 400 && statusCode != 403
 	}
 
 	fullURL := baseURL + "/" + path
 
-	for hdr, val := range bypassHeaders {
+	// --- Technique 1: Header-based bypasses (IP spoofing headers) ---
+	ipBypassHeaders := []struct {
+		header string
+		value  string
+	}{
+		{"X-Forwarded-For", "127.0.0.1"},
+		{"X-Real-IP", "127.0.0.1"},
+		{"X-Originating-IP", "127.0.0.1"},
+		{"X-Remote-IP", "127.0.0.1"},
+		{"X-Remote-Addr", "127.0.0.1"},
+		{"X-ProxyUser-Ip", "127.0.0.1"},
+		{"Client-IP", "127.0.0.1"},
+		{"X-Client-IP", "127.0.0.1"},
+		{"X-Host", "127.0.0.1"},
+		{"X-Forwarded-Host", "127.0.0.1"},
+	}
+
+	for _, h := range ipBypassHeaders {
 		req, err := http.NewRequest("GET", fullURL, nil)
 		if err != nil {
 			continue
 		}
 		req.Header.Set("User-Agent", getRandomUserAgent())
-		req.Header.Set(hdr, val)
+		req.Header.Set(h.header, h.value)
 
-		resp, err := client.Do(req)
+		resp, err := bypassClient.Do(req)
 		if err != nil {
 			continue
 		}
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			redirectURL := ""
-			if loc := resp.Header.Get("Location"); loc != "" {
-				redirectURL = loc
+		if isBypassSuccess(resp.StatusCode) {
+			cl := resp.Header.Get("Content-Length")
+			if cl == "" {
+				cl = strconv.Itoa(len(body))
 			}
 			return &FuzzResult{
 				Path:          "/" + path,
 				StatusCode:    resp.StatusCode,
-				ContentLength: resp.Header.Get("Content-Length"),
-				RedirectURL:   redirectURL,
-				BypassMethod:  fmt.Sprintf("header: %s: %s", hdr, val),
+				ContentLength: cl,
+				RedirectURL:   resp.Request.URL.String(),
+				BypassMethod:  fmt.Sprintf("header: %s: %s", h.header, h.value),
+			}
+		}
+	}
+
+	// --- Technique 1b: X-Original-URL / X-Rewrite-URL (IIS/Nginx path override) ---
+	// These headers override the path on the backend. The correct technique is
+	// to request the ROOT "/" and set the header to the target path.
+	for _, hdr := range []string{"X-Original-URL", "X-Rewrite-URL"} {
+		rootURL := baseURL + "/"
+		req, err := http.NewRequest("GET", rootURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", getRandomUserAgent())
+		req.Header.Set(hdr, "/"+path)
+
+		resp, err := bypassClient.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if isBypassSuccess(resp.StatusCode) {
+			cl := resp.Header.Get("Content-Length")
+			if cl == "" {
+				cl = strconv.Itoa(len(body))
+			}
+			return &FuzzResult{
+				Path:          "/" + path,
+				StatusCode:    resp.StatusCode,
+				ContentLength: cl,
+				RedirectURL:   resp.Request.URL.String(),
+				BypassMethod:  fmt.Sprintf("header: %s: /%s", hdr, path),
 			}
 		}
 	}
@@ -1043,22 +1181,23 @@ func try403Bypass(client *http.Client, baseURL string, path string) *FuzzResult 
 		}
 		req.Header.Set("User-Agent", getRandomUserAgent())
 
-		resp, err := client.Do(req)
+		resp, err := bypassClient.Do(req)
 		if err != nil {
 			continue
 		}
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			redirectURL := ""
-			if loc := resp.Header.Get("Location"); loc != "" {
-				redirectURL = loc
+		if isBypassSuccess(resp.StatusCode) {
+			cl := resp.Header.Get("Content-Length")
+			if cl == "" {
+				cl = strconv.Itoa(len(body))
 			}
 			return &FuzzResult{
 				Path:          "/" + path,
 				StatusCode:    resp.StatusCode,
-				ContentLength: resp.Header.Get("Content-Length"),
-				RedirectURL:   redirectURL,
+				ContentLength: cl,
+				RedirectURL:   resp.Request.URL.String(),
 				BypassMethod:  fmt.Sprintf("method: %s", method),
 			}
 		}
@@ -1094,22 +1233,23 @@ func try403Bypass(client *http.Client, baseURL string, path string) *FuzzResult 
 		}
 		req.Header.Set("User-Agent", getRandomUserAgent())
 
-		resp, err := client.Do(req)
+		resp, err := bypassClient.Do(req)
 		if err != nil {
 			continue
 		}
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			redirectURL := ""
-			if loc := resp.Header.Get("Location"); loc != "" {
-				redirectURL = loc
+		if isBypassSuccess(resp.StatusCode) {
+			cl := resp.Header.Get("Content-Length")
+			if cl == "" {
+				cl = strconv.Itoa(len(body))
 			}
 			return &FuzzResult{
 				Path:          "/" + pm.mutated,
 				StatusCode:    resp.StatusCode,
-				ContentLength: resp.Header.Get("Content-Length"),
-				RedirectURL:   redirectURL,
+				ContentLength: cl,
+				RedirectURL:   resp.Request.URL.String(),
 				BypassMethod:  fmt.Sprintf("path: %s", pm.label),
 			}
 		}
@@ -1544,7 +1684,15 @@ func main() {
 		openPorts = probePorts(*host, ports)
 	}
 
-	fmt.Printf("%s[+]%s Ports probing completed. Probing HTTP responses...\n", Green, Reset)
+	fmt.Printf("\n%s[+]%s Port scan complete. %s%d%s open ports found.\n", Green, Reset, Bold, len(openPorts), Reset)
+
+	// --- Scheme Detection Phase (runs only on open ports) ---
+	if len(openPorts) > 0 {
+		fmt.Printf("%s[*]%s Detecting scheme (HTTP/HTTPS) on %s%d%s open ports...\n", Cyan, Reset, Bold, len(openPorts), Reset)
+		openPorts = detectAndFillSchemes(openPorts)
+	}
+
+	fmt.Printf("%s[+]%s Scheme detection complete. Probing HTTP responses...\n", Green, Reset)
 	probeResults = probeAllResponses(openPorts)
 
 	// --- Path Fuzzing Phase ---
