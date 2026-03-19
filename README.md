@@ -39,7 +39,7 @@ wScanner -update
 | `-host` | — | Single target to scan |
 | `-input` | — | File with targets (one per line) |
 | `-timeout` | `15` | Request timeout in seconds |
-| `-rps` | `0` | Concurrency limit (0 = auto, max 1024) |
+| `-rps` | `0` | Max requests dispatched per second (0 = unlimited) |
 | `-output` | auto | Custom output folder name |
 | `-csv` | `false` | Generate CSV results |
 | `-stdout` | `true` | Print results to standard output |

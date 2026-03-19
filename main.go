@@ -57,7 +57,8 @@ var (
 	stdout       = flag.Bool("stdout", true, "Print results to **standard output** (stdout).")
 	local        = flag.Bool("local", false, "Indicates running in a **local network** environment (without general internet access).")
 	updateConfig = flag.Bool("update-config", false, "Fetch and update **configuration files** from remote sources.")
-	maxRPS       = flag.Int("rps", 0, "Maximum concurrent requests per second (global)")
+	maxRPS       = flag.Int("rps", 0, "Maximum requests dispatched per second (0 = unlimited)")
+	concurrency  = flag.Int("c", 0, "Max concurrent workers/connections (0 = auto, default cap 1024)")
 	outputDir    = flag.String("output", "", "Custom **output folder** name (default: wScanner_YYYYMMDD_HHMMSS).")
 	csvOut       = flag.Bool("csv", false, "Generate a **CSV** results file in the output folder.")
 	pathFile     = flag.String("path", "", "Custom **wordlist** file for directory/path fuzzing.")
@@ -311,9 +312,9 @@ func getMaxThreads() int {
 }
 
 func getConcurrencyLimit() int {
-	// If user specified -rps, honour it as the concurrency limit (no cap).
-	if *maxRPS > 0 {
-		return *maxRPS
+	// If user specified -c, use it directly (no cap).
+	if *concurrency > 0 {
+		return *concurrency
 	}
 	// Cross-platform: derive from CPU count instead of bash ulimit
 	limit := runtime.NumCPU() * 256
@@ -324,6 +325,18 @@ func getConcurrencyLimit() int {
 		limit = 100
 	}
 	return limit
+}
+
+// rpsThrottle blocks until the rate limiter allows the next request.
+// If -rps is not set (0), it returns immediately (no throttling).
+// Caller must call the returned stop function when done dispatching.
+func newRPSThrottle() (throttle func(), stop func()) {
+	if *maxRPS <= 0 {
+		return func() {}, func() {}
+	}
+	interval := time.Second / time.Duration(*maxRPS)
+	ticker := time.NewTicker(interval)
+	return func() { <-ticker.C }, ticker.Stop
 }
 
 func detectScheme(host string, port string) string {
@@ -382,19 +395,16 @@ func probePorts(target string, ports []string) ScanResultList {
 	var wg sync.WaitGroup
 
 	// Concurrency Limit
-	workerCount := 300
-	if len(ports) < workerCount {
-		workerCount = len(ports)
-	}
-
-	concurrencyLimit := getConcurrencyLimit()
-	if workerCount > concurrencyLimit {
-		workerCount = concurrencyLimit
-	}
-
+	workerCount := getConcurrencyLimit()
 	if totalPorts < workerCount {
 		workerCount = totalPorts
 	}
+
+	fmt.Printf("%s[*]%s Workers: %s%d%s", Cyan, Reset, Bold, workerCount, Reset)
+	if *maxRPS > 0 {
+		fmt.Printf(" | RPS limit: %s%d%s", Bold, *maxRPS, Reset)
+	}
+	fmt.Println()
 
 	// 1. Start Workers
 	for i := 0; i < workerCount; i++ {
@@ -418,8 +428,11 @@ func probePorts(target string, ports []string) ScanResultList {
 		}()
 	}
 
-	// 2. Send Jobs
+	// 2. Send Jobs (rate-limited if -rps is set)
+	throttle, stopThrottle := newRPSThrottle()
+	defer stopThrottle()
 	for _, port := range ports {
+		throttle()
 		jobs <- port
 	}
 	close(jobs)
@@ -462,7 +475,11 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 
 	workerCount := maxWorkers
 
-	fmt.Printf("%s[*]%s Setting concurrency limit to: %s%d%s\n", Cyan, Reset, Bold, workerCount, Reset)
+	fmt.Printf("%s[*]%s Workers: %s%d%s", Cyan, Reset, Bold, workerCount, Reset)
+	if *maxRPS > 0 {
+		fmt.Printf(" | RPS limit: %s%d%s", Bold, *maxRPS, Reset)
+	}
+	fmt.Println()
 
 	bar := NewProgressBar(maxtotalJobs)
 
@@ -487,8 +504,12 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 		}()
 	}
 
+	// Send jobs (rate-limited if -rps is set)
+	throttle, stopThrottle := newRPSThrottle()
+	defer stopThrottle()
 	for _, target := range targets {
 		for _, port := range ports {
+			throttle()
 			jobs <- targetItem{IP: target, Port: port}
 		}
 	}
@@ -682,8 +703,11 @@ func probeAllResponses(openPorts ScanResultList) ResponseResultList {
 		}()
 	}
 
-	// Send jobs
+	// Send jobs (rate-limited if -rps is set)
+	throttle, stopThrottle := newRPSThrottle()
+	defer stopThrottle()
 	for _, port := range openPorts {
+		throttle()
 		jobs <- port
 	}
 	close(jobs)
@@ -840,7 +864,9 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		}()
 	}
 
-	// Send jobs
+	// Send jobs (rate-limited if -rps is set)
+	throttle, stopThrottle := newRPSThrottle()
+	defer stopThrottle()
 	for idx, r := range results {
 		if len(r.TargetData.Scheme) < 1 {
 			continue
@@ -851,6 +877,7 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 			if p == "" {
 				continue
 			}
+			throttle()
 			jobs <- fuzzJob{ResultIdx: idx, BaseURL: baseURL, Path: p}
 		}
 	}
