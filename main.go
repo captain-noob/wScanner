@@ -34,7 +34,7 @@ const (
 	Bold   = "\033[1m"
 )
 
-var version = "beta-v6.2.0"
+var version = "beta-v6.3.0"
 
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
