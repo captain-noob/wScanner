@@ -1,5 +1,9 @@
+index.html
+index.php
+index.jsp
 ui/..\src\getSettings.rsb?@json
 gremlin
+v2/swagger.json
 .api/env
 .gitlab-ci.yml
 Jenkinsfile
@@ -743,3 +747,4 @@ logs/
 error-log
 console
 freenode
+docs

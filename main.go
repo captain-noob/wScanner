@@ -8,15 +8,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +51,9 @@ var folderName = "wScanner_" + time.Now().Format("20060102_150405")
 var isProgressBarCompleted = false
 var activeGoroutines int64
 
+// Global error logger — initialized in main() after output folder is created.
+var errLogger *ErrorLogger
+
 var (
 	portsFile    = flag.String("ports-file", "ports.txt", "File containing **newline-separated ports** to probe.")
 	inputFile    = flag.String("input", "", "File containing **newline-separated hostnames or IP addresses** to scan.")
@@ -63,6 +69,8 @@ var (
 	csvOut       = flag.Bool("csv", false, "Generate a **CSV** results file in the output folder.")
 	pathFile     = flag.String("path", "", "Custom **wordlist** file for directory/path fuzzing.")
 	selfUpdate   = flag.Bool("update", false, "Self-update wScanner to the **latest** GitHub release.")
+	forceCFScan  = flag.Bool("force-cf", false, "Force port scanning even for **Cloudflare** IPs.")
+	maxRetries   = flag.Int("retries", 2, "Number of **retries** for failed HTTP requests (transport errors only).")
 )
 
 // CSV columns
@@ -86,6 +94,122 @@ var csvHeaders = []string{
 	"ip",
 	"asn",
 	"cdn_waf",
+	"cname",
+	"ptr",
+	"ssl_cn",
+	"ssl_sans",
+}
+
+// Cloudflare IP ranges (populated by init)
+var cloudflareIPv4CIDRs []*net.IPNet
+var cloudflareIPv6CIDRs []*net.IPNet
+
+func init() {
+	// Standard Cloudflare IPv4 ranges
+	ipv4Ranges := []string{
+		"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+		"103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+		"190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+		"198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+		"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+	}
+	ipv6Ranges := []string{
+		"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+		"2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+		"2c0f:f248::/32",
+	}
+	for _, cidr := range ipv4Ranges {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			cloudflareIPv4CIDRs = append(cloudflareIPv4CIDRs, network)
+		}
+	}
+	for _, cidr := range ipv6Ranges {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil {
+			cloudflareIPv6CIDRs = append(cloudflareIPv6CIDRs, network)
+		}
+	}
+}
+
+// isCloudflareIP checks whether the given IP belongs to a Cloudflare range.
+func isCloudflareIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		// Might be a hostname — try resolving it first
+		addrs, err := net.LookupHost(ipStr)
+		if err != nil || len(addrs) == 0 {
+			return false
+		}
+		ip = net.ParseIP(addrs[0])
+		if ip == nil {
+			return false
+		}
+	}
+
+	for _, cidr := range cloudflareIPv4CIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	for _, cidr := range cloudflareIPv6CIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTarget performs CNAME and reverse DNS (PTR) lookups for a target.
+func resolveTarget(target string) (string, string) {
+	var cname, ptr string
+
+	// CNAME lookup (only meaningful for hostnames, not IPs)
+	if net.ParseIP(target) == nil {
+		if c, err := net.LookupCNAME(target); err == nil && c != target+"." && c != "" {
+			cname = strings.TrimSuffix(c, ".")
+		}
+	}
+
+	// PTR lookup — resolve hostname to IP first if needed
+	ipStr := target
+	if net.ParseIP(target) == nil {
+		addrs, err := net.LookupHost(target)
+		if err == nil && len(addrs) > 0 {
+			ipStr = addrs[0]
+		} else {
+			return cname, ptr
+		}
+	}
+
+	names, err := net.LookupAddr(ipStr)
+	if err == nil && len(names) > 0 {
+		ptr = strings.TrimSuffix(names[0], ".")
+	}
+
+	return cname, ptr
+}
+
+// extractSSLCertInfo performs a TLS handshake and extracts CN + SANs.
+func extractSSLCertInfo(host, port string) (string, []string) {
+	addr := net.JoinHostPort(host, port)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         host,
+	})
+	if err != nil {
+		return "", nil
+	}
+	defer conn.Close()
+
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", nil
+	}
+
+	leaf := certs[0]
+	return leaf.Subject.CommonName, leaf.DNSNames
 }
 
 var userAgentsFile *string
@@ -298,6 +422,39 @@ func readInputFile(filePath string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
+// readOpenPortsFile reads a file of "IP:Port" lines (written by probeTargets/probePorts)
+// and returns a ScanResultList. Used to recover partial port scan results on resume.
+func readOpenPortsFile(filePath string) (ScanResultList, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var results ScanResultList
+	seen := make(map[string]bool) // deduplicate
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// Parse "IP:Port" — handle IPv6 [addr]:port format too
+		host, port, splitErr := net.SplitHostPort(line)
+		if splitErr != nil {
+			continue
+		}
+		key := host + ":" + port
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		results = append(results, ScanResult{IP: host, Port: port})
+	}
+
+	return results, scanner.Err()
+}
+
 func getRandomUserAgent() string {
 	if len(cachedUserAgents) == 0 {
 		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36"
@@ -452,17 +609,54 @@ func probePorts(target string, ports []string) ScanResultList {
 		close(results)
 	}()
 
-	// 4. Collect Results (Main Thread)
+	// 4. Collect Results (Main Thread) — also write to open_ports_initial.txt
+	fname := folderName + "/open_ports_initial.txt"
+	file, err := os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not create open ports file: %v\n", Yellow, Reset, err)
+	}
+
 	var openPorts ScanResultList
 	for r := range results {
+		if file != nil {
+			file.WriteString(fmt.Sprintf("%s:%s\n", r.IP, r.Port))
+		}
 		openPorts = append(openPorts, r)
+	}
+
+	if file != nil {
+		file.Close()
 	}
 
 	return openPorts
 }
 
+// cloudflareSkipped tracks targets that were Cloudflare-detected and skipped.
+var cloudflareSkipped []string
+
 func probeTargets(targets []string, ports []string) ScanResultList {
-	totalIps := len(targets)
+	// --- Cloudflare pre-filter ---
+	var filteredTargets []string
+	for _, t := range targets {
+		if isCloudflareIP(t) {
+			cloudflareSkipped = append(cloudflareSkipped, t)
+			if !*forceCFScan {
+				// fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Skipping port scan.%s (use -force-cf to override)\n",
+				// 	Yellow, t, Reset)
+				continue
+			}
+			fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Force scanning enabled.%s\n",
+				Yellow, t, Reset)
+		}
+		filteredTargets = append(filteredTargets, t)
+	}
+
+	if len(filteredTargets) == 0 {
+		fmt.Printf("%s[!] All targets are Cloudflare IPs and were skipped.%s\n", Yellow, Reset)
+		return ScanResultList{}
+	}
+
+	totalIps := len(filteredTargets)
 	totalPorts := len(ports)
 
 	maxtotalJobs := totalIps * totalPorts
@@ -516,7 +710,7 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 	// Send jobs (rate-limited if -rps is set)
 	throttle, stopThrottle := newRPSThrottle()
 	defer stopThrottle()
-	for _, target := range targets {
+	for _, target := range filteredTargets {
 		for _, port := range ports {
 			throttle()
 			jobs <- targetItem{IP: target, Port: port}
@@ -564,6 +758,45 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 	return openPorts
 }
 
+// doHTTPRequestWithRetry wraps client.Do with retry logic and exponential backoff.
+// Only retries on transport-level errors (timeouts, connection refused), not HTTP status errors.
+func doHTTPRequestWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	retries := *maxRetries
+	if retries < 0 {
+		retries = 0
+	}
+
+	for attempt := 0; attempt <= retries; attempt++ {
+		resp, err = client.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+
+		// Don't retry on the last attempt
+		if attempt < retries {
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			if *verbose {
+				fmt.Printf("\n%s[!] Retry %d/%d%s for %s (backoff %v): %v\n",
+					Yellow, attempt+1, retries, Reset, req.URL.String(), backoff, err)
+			}
+			time.Sleep(backoff)
+
+			// Rebuild request (body may have been consumed)
+			newReq, cloneErr := http.NewRequest(req.Method, req.URL.String(), nil)
+			if cloneErr != nil {
+				return nil, err
+			}
+			newReq.Header = req.Header
+			req = newReq
+		}
+	}
+
+	return nil, err
+}
+
 func getResponse(item ScanResult) ResponseResult {
 	var outx ResponseResult
 
@@ -597,21 +830,51 @@ func getResponse(item ScanResult) ResponseResult {
 	}
 	req.Header.Set("User-Agent", getRandomUserAgent())
 
-	resp, err := client.Do(req)
+	resp, err := doHTTPRequestWithRetry(client, req)
 	if err != nil {
 		return outx
 	}
 
 	defer resp.Body.Close()
 
-	targetRedirect := ""
-	if resp.Request.URL.String() != "" {
-		targetRedirect = resp.Request.URL.String()
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return outx
+	}
+
+	// --- HTTP → HTTPS auto-handling ---
+	if resp.StatusCode == 400 && strings.Contains(string(body), "The plain HTTP request was sent to HTTPS") {
+		if *verbose {
+			fmt.Printf("\n%s[!] HTTP→HTTPS:%s %s — retrying with HTTPS\n", Yellow, Reset, InitialURI)
+		}
+		resp.Body.Close()
+
+		item.Scheme = "https"
+		outx.TargetData = item
+		InitialURI = fmt.Sprintf("https://%s:%s", item.IP, item.Port)
+
+		req2, err2 := http.NewRequest("GET", InitialURI, nil)
+		if err2 != nil {
+			return outx
+		}
+		req2.Header.Set("User-Agent", getRandomUserAgent())
+
+		resp2, err2 := doHTTPRequestWithRetry(client, req2)
+		if err2 != nil {
+			return outx
+		}
+		defer resp2.Body.Close()
+
+		body, err = io.ReadAll(resp2.Body)
+		if err != nil {
+			return outx
+		}
+		resp = resp2
+	}
+
+	targetRedirect := ""
+	if resp.Request.URL.String() != "" {
+		targetRedirect = resp.Request.URL.String()
 	}
 
 	re := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
@@ -873,9 +1136,10 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		// Only set baseline if the canary returns a "success" status (200-299)
-		// This means the target has a catch-all/custom 404 page.
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Set baseline for ANY valid response — catches custom 404, 403, 500, etc.
+		// This means the target has a catch-all/custom error page that responds
+		// with the same status code and similar body for non-existent paths.
+		if resp.StatusCode > 0 {
 			baselines[idx] = baseline{
 				statusCode:    resp.StatusCode,
 				contentLength: int64(len(body)),
@@ -1272,7 +1536,9 @@ func SaveCSV(results ResponseResultList) error {
 
 	// Header
 	header := []string{"target", "port", "scheme", "status_code", "content_type",
-		"content_length", "page_title", "server", "redirect_location", "recon_info", "discovered_paths"}
+		"content_length", "page_title", "server", "redirect_location",
+		"cname", "ptr", "ssl_cn", "ssl_sans",
+		"recon_info", "discovered_paths"}
 	if err := w.Write(header); err != nil {
 		return err
 	}
@@ -1309,6 +1575,10 @@ func SaveCSV(results ResponseResultList) error {
 			r.PageTitle,
 			r.Server,
 			r.RedirectURi,
+			r.CNAME,
+			r.PTR,
+			r.SSLCommonName,
+			strings.Join(r.SSLSANs, "; "),
 			reconStr,
 			pathsStr,
 		}
@@ -1320,12 +1590,33 @@ func SaveCSV(results ResponseResultList) error {
 	return nil
 }
 
-func createOutputFolder() bool {
-	err := os.Mkdir(folderName, 0755)
-	if err != nil {
-		return false
+// createOutputFolder creates the output directory.
+// Returns (isResume, ok).
+//   - If the folder doesn't exist: creates it, returns (false, true)
+//   - If the folder exists AND has .resume.json: returns (true, true) — resume mode
+//   - If the folder exists WITHOUT .resume.json: starts fresh in that folder (false, true)
+func createOutputFolder() (bool, bool) {
+	_, err := os.Stat(folderName)
+	if err == nil {
+		// Folder exists — check for resume file
+		_, stErr := os.Stat(resumePath(folderName))
+		if stErr == nil {
+			// .resume.json exists → resume mode
+			return true, true
+		}
+		// Folder exists but no resume file → previous scan was interrupted
+		// before any phase completed, or scan finished normally. Start fresh.
+		fmt.Printf("%s[*]%s Output folder '%s' exists (no resume state) → starting fresh scan\n",
+			Cyan, Reset, folderName)
+		return false, true
 	}
-	return true
+
+	// Folder doesn't exist — create it
+	if mkErr := os.MkdirAll(folderName, 0755); mkErr != nil {
+		fmt.Printf("%s[!] Error:%s Failed to create output folder: %v\n", Red, Reset, mkErr)
+		return false, false
+	}
+	return false, true
 }
 
 func SaveReport(results ResponseResultList) (string, error) {
@@ -1393,6 +1684,20 @@ func printStdout(results ResponseResultList) {
 			fmt.Printf(" %s• Redirect URI  :%s %s\n", Yellow, Reset, x.RedirectURi)
 		}
 
+		// --- DNS / SSL enrichment ---
+		if x.CNAME != "" {
+			fmt.Printf(" %s• CNAME         :%s %s%s%s\n", Bold, Reset, Cyan, x.CNAME, Reset)
+		}
+		if x.PTR != "" {
+			fmt.Printf(" %s• PTR (rDNS)    :%s %s%s%s\n", Bold, Reset, Cyan, x.PTR, Reset)
+		}
+		if x.SSLCommonName != "" {
+			fmt.Printf(" %s• SSL CN        :%s %s%s%s\n", Bold, Reset, Cyan, x.SSLCommonName, Reset)
+		}
+		if len(x.SSLSANs) > 0 {
+			fmt.Printf(" %s• SSL SANs      :%s %s%s%s\n", Bold, Reset, Cyan, strings.Join(x.SSLSANs, ", "), Reset)
+		}
+
 		if len(x.ReconInfo) > 0 {
 			fmt.Printf("\n %s[ Recon Information ]%s\n", Yellow, Reset)
 			for _, info := range x.ReconInfo {
@@ -1430,6 +1735,217 @@ func printStdout(results ResponseResultList) {
 		}
 		fmt.Println()
 	}
+}
+
+// enrichResults concurrently resolves CNAME, PTR, and extracts SSL cert info
+// for each result. It also writes Cloudflare IPs to cloudflare_ips.txt.
+func enrichResults(results ResponseResultList) ResponseResultList {
+	if len(results) == 0 {
+		return results
+	}
+
+	fmt.Printf("%s[*]%s Enriching %s%d%s results (CNAME, PTR, SSL)...\n", Cyan, Reset, Bold, len(results), Reset)
+
+	bar := NewProgressBar(len(results))
+
+	type enrichJob struct {
+		Idx int
+		R   ResponseResult
+	}
+	type enrichOut struct {
+		Idx           int
+		CNAME         string
+		PTR           string
+		SSLCommonName string
+		SSLSANs       []string
+	}
+
+	jobs := make(chan enrichJob, len(results))
+	outs := make(chan enrichOut, len(results))
+
+	var wg sync.WaitGroup
+
+	workerCount := getConcurrencyLimit()
+	if len(results) < workerCount {
+		workerCount = len(results)
+	}
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
+
+				cname, ptr := resolveTarget(job.R.TargetData.IP)
+
+				var cn string
+				var sans []string
+				if job.R.TargetData.Scheme == "https" || job.R.TargetData.Port == "443" {
+					cn, sans = extractSSLCertInfo(job.R.TargetData.IP, job.R.TargetData.Port)
+				}
+
+				outs <- enrichOut{
+					Idx:           job.Idx,
+					CNAME:         cname,
+					PTR:           ptr,
+					SSLCommonName: cn,
+					SSLSANs:       sans,
+				}
+
+				atomic.AddInt64(&activeGoroutines, -1)
+				bar.Update(1)
+			}
+		}()
+	}
+
+	for idx, r := range results {
+		jobs <- enrichJob{Idx: idx, R: r}
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(outs)
+	}()
+
+	for o := range outs {
+		results[o.Idx].CNAME = o.CNAME
+		results[o.Idx].PTR = o.PTR
+		results[o.Idx].SSLCommonName = o.SSLCommonName
+		results[o.Idx].SSLSANs = o.SSLSANs
+	}
+
+	fmt.Println()
+	return results
+}
+
+// sortResults sorts the results so 2xx status codes come first.
+func sortResults(results ResponseResultList) ResponseResultList {
+	sort.SliceStable(results, func(i, j int) bool {
+		si, _ := strconv.Atoi(results[i].StatusCode)
+		sj, _ := strconv.Atoi(results[j].StatusCode)
+		iIs2xx := si >= 200 && si < 300
+		jIs2xx := sj >= 200 && sj < 300
+		if iIs2xx && !jIs2xx {
+			return true
+		}
+		if !iIs2xx && jIs2xx {
+			return false
+		}
+		return si < sj
+	})
+	return results
+}
+
+// recheckEmptyResults re-probes open ports that returned no meaningful data.
+// Returns the updated results and a list of indices that were re-checked.
+func recheckEmptyResults(results ResponseResultList) (ResponseResultList, []int) {
+	var toRecheck []int
+	for i, r := range results {
+		if r.StatusCode == "" && len(r.TargetData.Scheme) > 0 {
+			toRecheck = append(toRecheck, i)
+		}
+	}
+
+	if len(toRecheck) == 0 {
+		return results, nil
+	}
+
+	fmt.Printf("%s[*]%s Re-checking %s%d%s ports with no data...\n", Cyan, Reset, Bold, len(toRecheck), Reset)
+
+	bar := NewProgressBar(len(toRecheck))
+
+	type recheckJob struct {
+		ResultIdx int
+		Item      ScanResult
+	}
+	type recheckOut struct {
+		ResultIdx int
+		Result    ResponseResult
+		Success   bool
+	}
+
+	jobs := make(chan recheckJob, len(toRecheck))
+	outs := make(chan recheckOut, len(toRecheck))
+
+	var wg sync.WaitGroup
+
+	workerCount := getConcurrencyLimit()
+	if len(toRecheck) < workerCount {
+		workerCount = len(toRecheck)
+	}
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				atomic.AddInt64(&activeGoroutines, 1)
+
+				item := job.Item
+				// Re-detect scheme
+				item.Scheme = detectScheme(item.IP, item.Port)
+				if len(item.Scheme) > 0 {
+					newResult := getResponse(item)
+					if newResult.StatusCode != "" {
+						newResult.Rechecked = true
+						if *verbose {
+							fmt.Printf("\n%s  [+] Re-check success:%s %s:%s → %s",
+								Green, Reset, item.IP, item.Port, newResult.StatusCode)
+						}
+						outs <- recheckOut{ResultIdx: job.ResultIdx, Result: newResult, Success: true}
+						atomic.AddInt64(&activeGoroutines, -1)
+						bar.Update(1)
+						continue
+					}
+				}
+				outs <- recheckOut{ResultIdx: job.ResultIdx, Success: false}
+
+				atomic.AddInt64(&activeGoroutines, -1)
+				bar.Update(1)
+			}
+		}()
+	}
+
+	for _, idx := range toRecheck {
+		jobs <- recheckJob{ResultIdx: idx, Item: results[idx].TargetData}
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(outs)
+	}()
+
+	var recheckedIndices []int
+	for o := range outs {
+		recheckedIndices = append(recheckedIndices, o.ResultIdx)
+		if o.Success {
+			results[o.ResultIdx] = o.Result
+		}
+	}
+
+	fmt.Println()
+	return results, recheckedIndices
+}
+
+// writeCloudflareIPs writes detected Cloudflare IPs to cloudflare_ips.txt.
+func writeCloudflareIPs(cfIPs []string) {
+	if len(cfIPs) == 0 {
+		return
+	}
+	fname := folderName + "/cloudflare_ips.txt"
+	file, err := os.Create(fname)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not create cloudflare_ips.txt: %v\n", Yellow, Reset, err)
+		return
+	}
+	defer file.Close()
+	for _, ip := range cfIPs {
+		file.WriteString(ip + "\n")
+	}
+	fmt.Printf("%s[✓] Cloudflare IPs saved to: %s ./%s/cloudflare_ips.txt\n", Green, Reset, folderName)
 }
 
 // --- Self-Update Logic ---
@@ -1589,6 +2105,121 @@ func runSelfUpdate() {
 	fmt.Printf("%s[✓] Updated successfully!%s  %s → %s\n", Green, Reset, version, release.TagName)
 }
 
+// saveFuzzingResults writes all path fuzzing results grouped by target.
+func saveFuzzingResults(results ResponseResultList) {
+	fname := folderName + "/fuzzing.txt"
+	file, err := os.Create(fname)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not create fuzzing.txt: %v\n", Yellow, Reset, err)
+		return
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
+	defer w.Flush()
+
+	count := 0
+	for _, r := range results {
+		if len(r.PathResults) == 0 {
+			continue
+		}
+		baseURL := fmt.Sprintf("%s://%s:%s", r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port)
+		w.WriteString(fmt.Sprintf("=== %s ===\n", baseURL))
+		for _, pr := range r.PathResults {
+			line := fmt.Sprintf("  [%d] %s", pr.StatusCode, pr.Path)
+			if pr.BypassMethod != "" {
+				line += fmt.Sprintf(" BYPASS(%s)", pr.BypassMethod)
+			}
+			if pr.RedirectURL != "" {
+				line += fmt.Sprintf(" -> %s", pr.RedirectURL)
+			}
+			if pr.ContentLength != "" {
+				line += fmt.Sprintf(" [%s]", pr.ContentLength)
+			}
+			w.WriteString(line + "\n")
+			count++
+		}
+		w.WriteString("\n")
+	}
+
+	if count > 0 {
+		fmt.Printf("%s[✓] Fuzzing results saved to: %s ./%s/fuzzing.txt (%d entries)\n", Green, Reset, folderName, count)
+	}
+}
+
+// saveRecheckedPorts writes the re-checked ports and their final status.
+func saveRecheckedPorts(results ResponseResultList, recheckedIndices []int) {
+	if len(recheckedIndices) == 0 {
+		return
+	}
+
+	fname := folderName + "/rechecked_ports.txt"
+	file, err := os.Create(fname)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not create rechecked_ports.txt: %v\n", Yellow, Reset, err)
+		return
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
+	defer w.Flush()
+
+	w.WriteString(fmt.Sprintf("# Re-checked ports (%d total)\n\n", len(recheckedIndices)))
+
+	for _, idx := range recheckedIndices {
+		if idx < 0 || idx >= len(results) {
+			continue
+		}
+		r := results[idx]
+		status := r.StatusCode
+		if status == "" {
+			status = "no_response"
+		}
+		scheme := r.TargetData.Scheme
+		if scheme == "" {
+			scheme = "unknown"
+		}
+		line := fmt.Sprintf("%s:%s  scheme=%s  status=%s  title=%q\n",
+			r.TargetData.IP, r.TargetData.Port, scheme, status, r.PageTitle)
+		w.WriteString(line)
+	}
+
+	fmt.Printf("%s[✓] Re-checked ports saved to: %s ./%s/rechecked_ports.txt\n", Green, Reset, folderName)
+}
+
+// saveValidatedEndpoints writes endpoints that returned valid 2xx/3xx responses.
+func saveValidatedEndpoints(results ResponseResultList) {
+	fname := folderName + "/validated.txt"
+	file, err := os.Create(fname)
+	if err != nil {
+		fmt.Printf("%s[!] Warning:%s Could not create validated.txt: %v\n", Yellow, Reset, err)
+		return
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
+	defer w.Flush()
+
+	count := 0
+	for _, r := range results {
+		if len(r.TargetData.Scheme) < 1 || r.StatusCode == "" {
+			continue
+		}
+		sc, _ := strconv.Atoi(r.StatusCode)
+		if sc >= 200 && sc < 400 {
+			line := fmt.Sprintf("%s://%s:%s  status=%s  title=%q  server=%s\n",
+				r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port,
+				r.StatusCode, r.PageTitle, r.Server)
+			w.WriteString(line)
+			count++
+		}
+	}
+
+	if count > 0 {
+		fmt.Printf("%s[✓] Validated endpoints saved to: %s ./%s/validated.txt (%d entries)\n", Green, Reset, folderName, count)
+	}
+}
+
 func main() {
 	// --- ANSI Color Definitions for "Cool" Output ---
 	fmt.Println()
@@ -1660,56 +2291,215 @@ func main() {
 		os.Exit(1)
 	}
 
-	if !createOutputFolder() {
-		fmt.Printf("%s[!] Error:%s Failed to create output folder\n", Red, Reset)
+	// --- Create Output Folder (with resume detection) ---
+	isResume, ok := createOutputFolder()
+	if !ok {
 		os.Exit(1)
 	}
 
-	// --- Scanning Phase ---
-	var probeResults ResponseResultList
-	var openPorts ScanResultList
+	// --- Initialize Error Logger ---
+	errLogger = NewErrorLogger(folderName)
+	if errLogger != nil {
+		defer errLogger.Close()
+		// Redirect Go's default logger to capture HTTP transport noise
+		log.SetOutput(errLogger)
+		log.SetFlags(0) // we handle timestamps ourselves
+	}
 
+	// --- Resume State ---
+	var state *ScanState
+	if isResume {
+		state, err = LoadState(folderName)
+		if err != nil {
+			fmt.Printf("%s[!] Error:%s Could not load resume state: %v\n", Red, Reset, err)
+			os.Exit(1)
+		}
+		if state != nil {
+			fmt.Printf("%s[*]%s Resuming scan from phase: %s%s%s\n",
+				Cyan, Reset, Bold, PhaseNames[state.CompletedPhase], Reset)
+		}
+	}
+	if state == nil {
+		state = &ScanState{CompletedPhase: PhaseNone}
+	}
+
+	// --- Build targets list ---
+	var targets []string
 	if *inputFile != "" {
-		targets, err := readInputFile(*inputFile)
+		targets, err = readInputFile(*inputFile)
 		if err != nil {
 			fmt.Printf("%s[!] Error reading input file:%s %v\n", Red, Reset, err)
 			os.Exit(1)
 		}
-
-		fmt.Printf("%s[*]%s Start scanning on %s%d%s targets from : %s\n", Cyan, Reset, Bold, len(targets), Reset, *inputFile)
-		openPorts = probeTargets(targets, ports)
-
 	} else if *host != "" {
-		fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, *host, Reset)
-		openPorts = probePorts(*host, ports)
+		targets = []string{*host}
 	}
 
-	fmt.Printf("\n%s[+]%s Port scan complete. %s%d%s open ports found.\n", Green, Reset, Bold, len(openPorts), Reset)
-
-	// --- Scheme Detection Phase (runs only on open ports) ---
-	if len(openPorts) > 0 {
-		fmt.Printf("%s[*]%s Detecting scheme (HTTP/HTTPS) on %s%d%s open ports...\n", Cyan, Reset, Bold, len(openPorts), Reset)
-		openPorts = detectAndFillSchemes(openPorts)
+	// Store targets & ports in state for resume validation
+	if state.CompletedPhase == PhaseNone {
+		state.Targets = targets
+		state.Ports = ports
 	}
 
-	fmt.Printf("%s[+]%s Scheme detection complete. Probing HTTP responses...\n", Green, Reset)
-	probeResults = probeAllResponses(openPorts)
-
-	// --- Path Fuzzing Phase ---
-	// Determine which path wordlist to use
-	pathWordlist := *pathsFile // default from assets
-	if *pathFile != "" {
-		pathWordlist = *pathFile // user override
-	}
-
-	if pathWordlist != "" {
-		pathLines, err := readInputFile(pathWordlist)
-		if err != nil {
-			fmt.Printf("%s[!] Warning:%s Could not load paths wordlist: %v (skipping path fuzzing)\n", Yellow, Reset, err)
-		} else if len(pathLines) > 0 {
-			probeResults = fuzzPaths(probeResults, pathLines)
+	// --- Ctrl+C Signal Handler: save state before exiting ---
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		<-sigChan
+		fmt.Printf("\n%s[!] Interrupt received — saving scan state...%s\n", Yellow, Reset)
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		} else {
+			fmt.Printf("%s[✓] State saved to %s/.resume.json — re-run the same command to resume.%s\n",
+				Green, folderName, Reset)
 		}
+		if errLogger != nil {
+			errLogger.Close()
+		}
+		os.Exit(130)
+	}()
+
+	// --- Scanning Phase ---
+	var probeResults ResponseResultList
+	var openPorts ScanResultList
+	var recheckedIndices []int
+
+	// Phase 1: Port Scanning
+	if state.CompletedPhase < PhasePortScan {
+		// Check for partial results from a previous interrupted port scan
+		partialFile := folderName + "/open_ports_initial.txt"
+		if partialPorts, readErr := readOpenPortsFile(partialFile); readErr == nil && len(partialPorts) > 0 {
+			fmt.Printf("%s[*]%s Recovered %s%d%s open ports from previous interrupted scan\n",
+				Cyan, Reset, Bold, len(partialPorts), Reset)
+			openPorts = partialPorts
+		} else {
+			if *inputFile != "" {
+				fmt.Printf("%s[*]%s Start scanning on %s%d%s targets from : %s\n", Cyan, Reset, Bold, len(targets), Reset, *inputFile)
+				openPorts = probeTargets(targets, ports)
+			} else if *host != "" {
+				// Single target — check Cloudflare
+				if isCloudflareIP(*host) {
+					cloudflareSkipped = append(cloudflareSkipped, *host)
+					if !*forceCFScan {
+						fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Skipping port scan.%s (use -force-cf to override)\n",
+							Yellow, *host, Reset)
+					} else {
+						fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Force scanning enabled.%s\n",
+							Yellow, *host, Reset)
+						fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, *host, Reset)
+						openPorts = probePorts(*host, ports)
+					}
+				} else {
+					fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, *host, Reset)
+					openPorts = probePorts(*host, ports)
+				}
+			}
+		}
+
+		fmt.Printf("\n%s[+]%s Port scan complete. %s%d%s open ports found.\n", Green, Reset, Bold, len(openPorts), Reset)
+
+		state.OpenPorts = openPorts
+		state.CompletedPhase = PhasePortScan
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		}
+	} else {
+		openPorts = state.OpenPorts
+		fmt.Printf("%s[*]%s Skipping port scan (already completed, %s%d%s open ports)\n",
+			Cyan, Reset, Bold, len(openPorts), Reset)
 	}
+
+	// Phase 2: Scheme Detection
+	if state.CompletedPhase < PhaseSchemeDetect {
+		if len(openPorts) > 0 {
+			fmt.Printf("%s[*]%s Detecting scheme (HTTP/HTTPS) on %s%d%s open ports...\n", Cyan, Reset, Bold, len(openPorts), Reset)
+			openPorts = detectAndFillSchemes(openPorts)
+		}
+
+		state.OpenPorts = openPorts
+		state.CompletedPhase = PhaseSchemeDetect
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		}
+	} else {
+		fmt.Printf("%s[*]%s Skipping scheme detection (already completed)\n", Cyan, Reset)
+	}
+
+	// Phase 3: HTTP Probe
+	if state.CompletedPhase < PhaseHTTPProbe {
+		fmt.Printf("%s[+]%s Probing HTTP responses...\n", Green, Reset)
+		probeResults = probeAllResponses(openPorts)
+
+		state.ProbeResults = probeResults
+		state.CompletedPhase = PhaseHTTPProbe
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		}
+	} else {
+		probeResults = state.ProbeResults
+		fmt.Printf("%s[*]%s Skipping HTTP probe (already completed)\n", Cyan, Reset)
+	}
+
+	// Phase 4: Re-check ports with no data
+	if state.CompletedPhase < PhaseRecheck {
+		probeResults, recheckedIndices = recheckEmptyResults(probeResults)
+
+		state.ProbeResults = probeResults
+		state.RecheckedIndices = recheckedIndices
+		state.CompletedPhase = PhaseRecheck
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		}
+	} else {
+		recheckedIndices = state.RecheckedIndices
+		fmt.Printf("%s[*]%s Skipping re-check (already completed)\n", Cyan, Reset)
+	}
+
+	// Phase 5: Path Fuzzing
+	if state.CompletedPhase < PhaseFuzz {
+		// Determine which path wordlist to use
+		pathWordlist := *pathsFile // default from assets
+		if *pathFile != "" {
+			pathWordlist = *pathFile // user override
+		}
+
+		if pathWordlist != "" {
+			pathLines, pathErr := readInputFile(pathWordlist)
+			if pathErr != nil {
+				fmt.Printf("%s[!] Warning:%s Could not load paths wordlist: %v (skipping path fuzzing)\n", Yellow, Reset, pathErr)
+			} else if len(pathLines) > 0 {
+				probeResults = fuzzPaths(probeResults, pathLines)
+			}
+		}
+
+		state.ProbeResults = probeResults
+		state.CompletedPhase = PhaseFuzz
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		}
+	} else {
+		fmt.Printf("%s[*]%s Skipping path fuzzing (already completed)\n", Cyan, Reset)
+	}
+
+	// Phase 6: Enrichment (CNAME, PTR, SSL)
+	if state.CompletedPhase < PhaseEnrich {
+		probeResults = enrichResults(probeResults)
+
+		state.ProbeResults = probeResults
+		state.CompletedPhase = PhaseEnrich
+		if saveErr := SaveState(folderName, state); saveErr != nil {
+			fmt.Printf("%s[!] Warning:%s Could not save state: %v\n", Yellow, Reset, saveErr)
+		}
+	} else {
+		probeResults = state.ProbeResults
+		fmt.Printf("%s[*]%s Skipping enrichment (already completed)\n", Cyan, Reset)
+	}
+
+	// --- Sort results: 2xx first ---
+	probeResults = sortResults(probeResults)
+
+	// --- Write Cloudflare IPs file ---
+	writeCloudflareIPs(cloudflareSkipped)
 
 	// --- Results Display ---
 	if *stdout {
@@ -1732,4 +2522,13 @@ func main() {
 			fmt.Printf("%s[✓] CSV saved to: %s ./%s/results.csv\n", Green, Reset, folderName)
 		}
 	}
+
+	// --- Separate Output Files ---
+	saveFuzzingResults(probeResults)
+	saveRecheckedPorts(probeResults, recheckedIndices)
+	saveValidatedEndpoints(probeResults)
+
+	// --- Mark scan as complete — remove resume state ---
+	ClearState(folderName)
+	fmt.Printf("%s[✓] Scan completed successfully.%s\n", Green, Reset)
 }

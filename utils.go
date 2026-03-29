@@ -364,6 +364,8 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                         <th style="width: 100px;">Status</th>
                         <th>Server</th>
                         <th style="width: 150px;">Meta</th>
+                        <th style="width: 160px;">DNS Info</th>
+                        <th style="width: 250px;">SSL Certificate</th>
                         <th style="width: 350px;">Recon Data</th>
                         <th style="width: 300px;">Discovered Paths</th>
                     </tr>
@@ -423,6 +425,35 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                     <td class="meta-info">
                         <div>{{ $r.ContentType }}</div>
                         <div style="margin-top:4px;">Size: {{ $r.ContentLength }}</div>
+                    </td>
+
+                    <td class="meta-info">
+                        {{- if ne $r.CNAME "" }}
+                        <div><strong>CNAME:</strong> <span class="font-mono">{{ $r.CNAME }}</span></div>
+                        {{- end }}
+                        {{- if ne $r.PTR "" }}
+                        <div style="margin-top:4px;"><strong>PTR:</strong> <span class="font-mono">{{ $r.PTR }}</span></div>
+                        {{- end }}
+                        {{- if and (eq $r.CNAME "") (eq $r.PTR "") }}
+                        <span class="text-empty">—</span>
+                        {{- end }}
+                    </td>
+
+                    <td class="meta-info">
+                        {{- if ne $r.SSLCommonName "" }}
+                        <div><strong>CN:</strong> <span class="font-mono">{{ $r.SSLCommonName }}</span></div>
+                        {{- end }}
+                        {{- if gt (len $r.SSLSANs) 0 }}
+                        <div style="margin-top:4px;"><strong>SANs:</strong></div>
+                        <ul style="list-style:none;padding:0;margin:4px 0 0 0;">
+                        {{- range $r.SSLSANs }}
+                        <li class="font-mono" style="font-size:0.8em;color:var(--text-muted);">{{ . }}</li>
+                        {{- end }}
+                        </ul>
+                        {{- end }}
+                        {{- if and (eq $r.SSLCommonName "") (eq (len $r.SSLSANs) 0) }}
+                        <span class="text-empty">—</span>
+                        {{- end }}
                     </td>
 
                     <td>

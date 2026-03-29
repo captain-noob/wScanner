@@ -5,9 +5,13 @@ import "sync"
 type PortScanResult map[string][]string
 
 type ScanResult struct {
-	IP     string
-	Port   string
-	Scheme string
+	IP            string
+	Port          string
+	Scheme        string
+	CNAME         string
+	PTR           string
+	SSLCommonName string
+	SSLSANs       []string
 }
 
 type ScanResultList []ScanResult
@@ -42,6 +46,11 @@ type ResponseResult struct {
 	ContentLength string
 	ReconInfo     []ReconInfo
 	PathResults   FuzzResultList
+	CNAME         string
+	PTR           string
+	SSLCommonName string
+	SSLSANs       []string
+	Rechecked     bool // true if this result was re-checked in the recheck phase
 }
 
 type ResponseResultList []ResponseResult
