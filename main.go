@@ -37,7 +37,7 @@ const (
 	Bold   = "\033[1m"
 )
 
-var version = "beta-v6.3.0"
+var version = "1.0.0-stable"
 
 const remoteHeaders = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/headers.json"
 const remoteUserAgents = "https://raw.githubusercontent.com/captain-noob/wScanner/refs/heads/main/Assets/user-agent.txt"
@@ -1106,6 +1106,8 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 	fmt.Printf("%s[*]%s Running wildcard baseline detection on %s%d%s targets...\n",
 		Cyan, Reset, Bold, validTargets, Reset)
 
+	bar := NewProgressBar(validTargets)
+
 	baselineClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -1116,38 +1118,99 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		},
 	}
 
+	type baselineJob struct {
+		Idx     int
+		BaseURL string
+	}
+	type baselineOut struct {
+		Idx     int
+		Status  int
+		BodyLen int64
+		Found   bool
+	}
+
+	// Collect jobs
+	var blJobs []baselineJob
 	for idx, r := range results {
 		if len(r.TargetData.Scheme) < 1 {
 			continue
 		}
 		baseURL := fmt.Sprintf("%s://%s:%s", r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port)
-		canaryPath := fmt.Sprintf("this-path-should-never-exist-%d-%d", rand.Intn(999999), rand.Intn(999999))
+		blJobs = append(blJobs, baselineJob{Idx: idx, BaseURL: baseURL})
+	}
 
-		req, err := http.NewRequest("GET", baseURL+"/"+canaryPath, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("User-Agent", getRandomUserAgent())
+	blJobsCh := make(chan baselineJob, len(blJobs))
+	blOutsCh := make(chan baselineOut, len(blJobs))
 
-		resp, err := baselineClient.Do(req)
-		if err != nil {
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+	var blWg sync.WaitGroup
+	blWorkers := getConcurrencyLimit()
+	if len(blJobs) < blWorkers {
+		blWorkers = len(blJobs)
+	}
 
-		// Set baseline for ANY valid response — catches custom 404, 403, 500, etc.
-		// This means the target has a catch-all/custom error page that responds
-		// with the same status code and similar body for non-existent paths.
-		if resp.StatusCode > 0 {
-			baselines[idx] = baseline{
-				statusCode:    resp.StatusCode,
-				contentLength: int64(len(body)),
+	for i := 0; i < blWorkers; i++ {
+		blWg.Add(1)
+		go func() {
+			defer blWg.Done()
+			for job := range blJobsCh {
+				atomic.AddInt64(&activeGoroutines, 1)
+
+				canaryPath := fmt.Sprintf("this-path-should-never-exist-%d-%d", rand.Intn(999999), rand.Intn(999999))
+				req, err := http.NewRequest("GET", job.BaseURL+"/"+canaryPath, nil)
+				if err != nil {
+					blOutsCh <- baselineOut{Idx: job.Idx, Found: false}
+					atomic.AddInt64(&activeGoroutines, -1)
+					bar.Update(1)
+					continue
+				}
+				req.Header.Set("User-Agent", getRandomUserAgent())
+
+				resp, err := baselineClient.Do(req)
+				if err != nil {
+					blOutsCh <- baselineOut{Idx: job.Idx, Found: false}
+					atomic.AddInt64(&activeGoroutines, -1)
+					bar.Update(1)
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if resp.StatusCode > 0 {
+					blOutsCh <- baselineOut{Idx: job.Idx, Status: resp.StatusCode, BodyLen: int64(len(body)), Found: true}
+					if *verbose {
+						fmt.Printf("\n%s  [!]%s Wildcard detected on %s%s%s (status %d, ~%d bytes) → auto-filtering",
+							Yellow, Reset, Bold, job.BaseURL, Reset, resp.StatusCode, len(body))
+					}
+				} else {
+					blOutsCh <- baselineOut{Idx: job.Idx, Found: false}
+				}
+
+				atomic.AddInt64(&activeGoroutines, -1)
+				bar.Update(1)
 			}
-			fmt.Printf("%s  [!]%s Wildcard detected on %s%s%s (status %d, ~%d bytes) → auto-filtering\n",
-				Yellow, Reset, Bold, baseURL, Reset, resp.StatusCode, len(body))
+		}()
+	}
+
+	for _, j := range blJobs {
+		blJobsCh <- j
+	}
+	close(blJobsCh)
+
+	go func() {
+		blWg.Wait()
+		close(blOutsCh)
+	}()
+
+	for o := range blOutsCh {
+		if o.Found {
+			baselines[o.Idx] = baseline{
+				statusCode:    o.Status,
+				contentLength: o.BodyLen,
+			}
 		}
 	}
+
+	fmt.Println()
 
 	totalJobs := validTargets * len(paths)
 	fmt.Printf("%s[*]%s Fuzzing %s%d%s paths across %s%d%s targets (%d total requests)...\n",
@@ -1174,7 +1237,7 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		workerCount = totalJobs
 	}
 
-	bar := NewProgressBar(totalJobs)
+	bar = NewProgressBar(totalJobs)
 
 	// Track wildcard-filtered count per target (thread-safe)
 	var filteredCount int64
@@ -1323,7 +1386,7 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		results[fr.ResultIdx].PathResults = append(results[fr.ResultIdx].PathResults, fr.Result)
 	}
 
-	if fc := atomic.LoadInt64(&filteredCount); fc > 0 {
+	if fc := atomic.LoadInt64(&filteredCount); fc > 0 && *verbose {
 		fmt.Printf("\n%s[*]%s Wildcard filter suppressed %s%d%s false-positive responses\n", Cyan, Reset, Bold, fc, Reset)
 	}
 	fmt.Println()

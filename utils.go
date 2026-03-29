@@ -11,443 +11,485 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Scan Report</title>
+    <title>wScanner Report</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
         :root {
-            /* Slate Color Palette */
-            --bg-body: #f8fafc;
-            --bg-card: #ffffff;
-            --text-main: #0f172a;
-            --text-muted: #64748b;
-            --border: #e2e8f0;
-            --primary: #3b82f6;
-            --primary-bg: #eff6ff;
-            
+            --bg-body: #0f1117;
+            --bg-card: #1a1d27;
+            --bg-card-alt: #21242f;
+            --bg-hover: #252837;
+            --text-main: #e4e6f0;
+            --text-muted: #8b8fa7;
+            --text-dim: #5a5e73;
+            --border: #2a2d3a;
+            --border-subtle: #222536;
+            --primary: #6c8cff;
+            --primary-dim: rgba(108,140,255,0.12);
+            --accent-green: #3dd68c;
+            --accent-green-dim: rgba(61,214,140,0.12);
+
             /* Status Colors */
-            --status-2xx-bg: #dcfce7; --status-2xx-text: #166534;
-            --status-3xx-bg: #dbeafe; --status-3xx-text: #1e40af;
-            --status-4xx-bg: #ffedd5; --status-4xx-text: #9a3412;
-            --status-5xx-bg: #fee2e2; --status-5xx-text: #991b1b;
+            --s2-bg: rgba(61,214,140,0.12); --s2-text: #3dd68c; --s2-border: rgba(61,214,140,0.25);
+            --s3-bg: rgba(108,140,255,0.12); --s3-text: #6c8cff; --s3-border: rgba(108,140,255,0.25);
+            --s4-bg: rgba(255,170,80,0.12); --s4-text: #ffaa50; --s4-border: rgba(255,170,80,0.25);
+            --s5-bg: rgba(255,90,90,0.12); --s5-text: #ff5a5a; --s5-border: rgba(255,90,90,0.25);
         }
 
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
 
         body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-body);
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-body);
             color: var(--text-main);
-            margin: 0;
-            padding: 24px;
-            font-size: 14px;
+            font-size: 13px;
             line-height: 1.5;
+            min-height: 100vh;
         }
 
-        .container {
-            max-width: 1800px;
+        .layout {
+            max-width: 1920px;
             margin: 0 auto;
+            padding: 20px;
             display: flex;
             flex-direction: column;
-            gap: 24px;
-        }
-
-        /* --- Header & Filters --- */
-        .dashboard-header {
-            background: var(--bg-card);
-            padding: 24px;
-            border-radius: 12px;
-            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-            border: 1px solid var(--border);
-        }
-
-        .header-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        h1 { margin: 0; font-size: 1.5rem; font-weight: 700; color: var(--text-main); letter-spacing: -0.025em; }
-        .meta-tag { background: var(--bg-body); padding: 4px 12px; border-radius: 99px; font-size: 0.85rem; color: var(--text-muted); border: 1px solid var(--border); }
-
-        .filter-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 16px;
-            align-items: end;
         }
 
-        .input-group label {
-            display: block;
-            font-size: 0.75rem;
-            font-weight: 600;
-            color: var(--text-muted);
-            margin-bottom: 6px;
-            text-transform: uppercase;
-            letter-spacing: 0.025em;
-        }
-
-        .input {
-            width: 100%;
-            padding: 10px 12px;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            font-family: inherit;
-            font-size: 0.9rem;
-            color: var(--text-main);
-            background-color: #fff;
-            transition: all 0.2s;
-            height: 42px; /* Uniform height */
-        }
-
-        .input:focus {
-            outline: none;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
-        }
-
-        select.input {
-            cursor: pointer;
-            appearance: none;
-            background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%2364748b' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
-            background-position: right 0.75rem center;
-            background-repeat: no-repeat;
-            background-size: 1.25em 1.25em;
-            padding-right: 2.5rem;
-        }
-
-        /* --- Buttons --- */
-        button.btn-reset {
-            background-color: var(--text-main);
-            color: white;
-            border: none;
-            font-weight: 500;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        button.btn-reset:hover { background-color: #334155; }
-        button.btn-reset:active { transform: translateY(1px); }
-
-        /* --- Data Table --- */
-        .table-card {
+        /* ── Header ── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
             background: var(--bg-card);
-            border-radius: 12px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
             border: 1px solid var(--border);
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
+            border-radius: 10px;
         }
-
-        .table-container {
-            overflow-x: auto;
-            width: 100%;
-            max-height: 75vh; /* Vertical scroll for massive lists */
-        }
-
-        table {
-            width: 100%;
-            border-collapse: separate; /* Allows sticky header */
-            border-spacing: 0;
-            min-width: 1200px;
-        }
-
-        thead {
-            position: sticky;
-            top: 0;
-            z-index: 10;
-            background: #f8fafc;
-        }
-
-        th {
-            background: #f1f5f9;
-            text-align: left;
-            padding: 16px;
+        .header-left { display: flex; align-items: center; gap: 12px; }
+        .header h1 {
+            font-size: 1.1rem;
             font-weight: 600;
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-muted);
-            border-bottom: 1px solid var(--border);
-            white-space: nowrap;
-        }
-
-        td {
-            padding: 16px;
-            border-bottom: 1px solid var(--border);
-            vertical-align: top;
             color: var(--text-main);
-            font-size: 0.9rem;
+            letter-spacing: -0.02em;
+        }
+        .header .logo {
+            width: 28px; height: 28px;
+            background: linear-gradient(135deg, var(--primary), var(--accent-green));
+            border-radius: 7px;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 14px; color: #0f1117;
         }
 
-        tbody tr { transition: background-color 0.15s ease; }
-        tbody tr:hover { background-color: #f8fafc; }
-        tbody tr:last-child td { border-bottom: none; }
-
-        /* --- Column Styles --- */
-        .font-mono { font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
-
-        .cell-target { display: flex; flex-direction: column; gap: 4px; }
-        .target-ip { font-weight: 600; color: var(--text-main); }
-        .target-port { font-size: 0.8em; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
-        
-        .badge { 
-            display: inline-flex; 
-            align-items: center; 
-            padding: 2px 8px; 
-            border-radius: 6px; 
-            font-weight: 600; 
-            font-size: 0.75em;
-            text-transform: uppercase;
-            letter-spacing: 0.02em;
-        }
-        
-        .badge-scheme { background: var(--border); color: var(--text-muted); }
-        
-        .badge-status { border-radius: 99px; padding: 4px 10px; }
-        .status-2xx { background: var(--status-2xx-bg); color: var(--status-2xx-text); }
-        .status-3xx { background: var(--status-3xx-bg); color: var(--status-3xx-text); }
-        .status-4xx { background: var(--status-4xx-bg); color: var(--status-4xx-text); }
-        .status-5xx { background: var(--status-5xx-bg); color: var(--status-5xx-text); }
-
-        .cell-uri { max-width: 400px; word-break: break-all; }
-        .uri-main { color: var(--primary); font-weight: 500; margin-bottom: 6px; display: block; text-decoration: none; }
-        .uri-main:hover { text-decoration: underline; }
-        
-        .redirect-flow { 
-            font-size: 0.85em; 
-            color: var(--text-muted); 
-            display: flex; 
-            align-items: center; 
-            gap: 6px; 
-            margin-top: 4px;
-            background: #f8fafc;
-            padding: 4px 8px;
-            border-radius: 4px;
-            width: fit-content;
-        }
-
-        .server-tag {
-            background: #f1f5f9;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 0.85em;
-            color: var(--text-main);
-            border: 1px solid var(--border);
-            display: inline-block;
-        }
-
-        .meta-info { font-size: 0.85em; color: var(--text-muted); line-height: 1.6; }
-
-        /* --- Recon List --- */
-        .recon-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
-        .recon-item { 
-            font-size: 0.85em; 
-            padding: 8px; 
-            background: #f8fafc; 
-            border-radius: 6px; 
-            border: 1px solid var(--border);
+        /* ── Stats Bar ── */
+        .stats {
             display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-        .recon-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; }
-        .recon-cat { color: var(--primary); font-weight: 700; font-size: 0.8em; text-transform: uppercase; }
-        .recon-purpose { color: var(--text-muted); font-size: 0.8em; font-style: italic; margin-left: 8px; }
-        .recon-key { color: var(--text-muted); font-family: 'JetBrains Mono', monospace; font-size: 0.9em; }
-        .recon-val { color: var(--text-main); word-break: break-all; }
-
-        .no-results { 
-            padding: 60px; 
-            text-align: center; 
-            color: var(--text-muted); 
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            gap: 12px;
-        }
-        .no-results svg { width: 48px; height: 48px; opacity: 0.5; }
-
-        /* Utilities */
-        .text-empty { color: #cbd5e1; font-style: italic; }
-
-        /* --- Path Fuzz List --- */
-        .path-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
-        .path-item {
-            font-size: 0.85em;
-            padding: 6px 8px;
-            background: #f8fafc;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-            display: flex;
-            align-items: center;
             gap: 8px;
+            flex-wrap: wrap;
+        }
+        .stat-chip {
+            padding: 6px 14px;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            display: flex; align-items: center; gap: 6px;
+        }
+        .stat-chip .val {
+            font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
         }
-        .path-item .badge-status { font-size: 0.7em; min-width: 36px; text-align: center; }
-        .path-name { word-break: break-all; color: var(--text-main); }
-        .path-redirect { font-size: 0.8em; color: var(--text-muted); margin-left: auto; }
+        .stat-chip.stat-2xx .val { color: var(--s2-text); }
+        .stat-chip.stat-3xx .val { color: var(--s3-text); }
+        .stat-chip.stat-4xx .val { color: var(--s4-text); }
+        .stat-chip.stat-5xx .val { color: var(--s5-text); }
+
+        /* ── Filters ── */
+        .filters {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+            padding: 12px 16px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+        .filters input, .filters select {
+            padding: 7px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-card-alt);
+            color: var(--text-main);
+            font-family: inherit;
+            font-size: 0.8rem;
+            height: 34px;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .filters input { min-width: 220px; flex: 1; }
+        .filters select { min-width: 130px; cursor: pointer; -webkit-appearance: none; appearance: none; padding-right: 28px;
+            background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%238b8fa7' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+            background-position: right 8px center; background-repeat: no-repeat; background-size: 14px;
+        }
+        .filters input:focus, .filters select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px var(--primary-dim);
+        }
+        .filters input::placeholder { color: var(--text-dim); }
+        .btn-reset-filters {
+            padding: 7px 14px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-card-alt);
+            color: var(--text-muted);
+            font-family: inherit;
+            font-size: 0.8rem;
+            height: 34px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .btn-reset-filters:hover { background: var(--bg-hover); color: var(--text-main); }
+        .filter-count {
+            margin-left: auto;
+            font-size: 0.78rem;
+            color: var(--text-dim);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* ── Table ── */
+        .table-wrap {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .table-scroll {
+            overflow-x: auto;
+            overflow-y: auto;
+            max-height: 78vh;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 1400px;
+        }
+        thead { position: sticky; top: 0; z-index: 10; }
+        th {
+            background: var(--bg-card-alt);
+            text-align: left;
+            padding: 10px 14px;
+            font-weight: 600;
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-dim);
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border-subtle);
+            vertical-align: top;
+            font-size: 0.82rem;
+            color: var(--text-main);
+        }
+        tbody tr { transition: background 0.12s; }
+        tbody tr:hover { background: var(--bg-hover); }
+        tbody tr:last-child td { border-bottom: none; }
+
+        /* ── Column Styles ── */
+        .mono { font-family: 'JetBrains Mono', monospace; font-size: 0.78em; }
+
+        .ip-cell { font-weight: 600; color: var(--text-main); white-space: nowrap; }
+        .port-cell { color: var(--primary); font-weight: 500; }
+
+        .scheme-badge {
+            display: inline-block;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 0.68em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .scheme-https { background: var(--accent-green-dim); color: var(--accent-green); border: 1px solid rgba(61,214,140,0.2); }
+        .scheme-http { background: var(--s4-bg); color: var(--s4-text); border: 1px solid var(--s4-border); }
+
+        .status-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 99px;
+            font-size: 0.72em;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            letter-spacing: 0.02em;
+        }
+        .status-2xx { background: var(--s2-bg); color: var(--s2-text); border: 1px solid var(--s2-border); }
+        .status-3xx { background: var(--s3-bg); color: var(--s3-text); border: 1px solid var(--s3-border); }
+        .status-4xx { background: var(--s4-bg); color: var(--s4-text); border: 1px solid var(--s4-border); }
+        .status-5xx { background: var(--s5-bg); color: var(--s5-text); border: 1px solid var(--s5-border); }
+
+        .uri-link {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+            word-break: break-all;
+            font-size: 0.8em;
+        }
+        .uri-link:hover { text-decoration: underline; }
+
+        .redirect-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            margin-top: 4px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-subtle);
+            font-size: 0.72em;
+            color: var(--text-muted);
+            word-break: break-all;
+        }
+        .redirect-tag .arrow { color: var(--s3-text); font-weight: 600; }
+
+        .title-cell { font-weight: 500; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+        .title-cell[title] { cursor: help; }
+
+        .server-chip {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+        }
+
+        .meta-cell { color: var(--text-muted); font-size: 0.78em; line-height: 1.5; }
+        .meta-cell .label { color: var(--text-dim); font-size: 0.9em; }
+
+        .dns-cell { font-size: 0.78em; }
+        .dns-row { display: flex; align-items: baseline; gap: 4px; margin-bottom: 2px; }
+        .dns-label { color: var(--text-dim); font-weight: 600; font-size: 0.85em; min-width: 42px; }
+        .dns-val { color: var(--primary); word-break: break-all; }
+
+        .ssl-cell { font-size: 0.78em; }
+        .ssl-cn { color: var(--accent-green); font-weight: 500; }
+        .ssl-san { color: var(--text-muted); font-size: 0.9em; }
+        .ssl-san-list { list-style: none; padding: 0; margin: 3px 0 0; }
+        .ssl-san-list li { padding: 1px 0; }
+        .ssl-san-list li::before { content: "•"; color: var(--text-dim); margin-right: 4px; }
+
+        /* ── Recon items ── */
+        .recon-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+        .recon-chip {
+            padding: 5px 8px;
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-subtle);
+            border-radius: 5px;
+            font-size: 0.76em;
+        }
+        .recon-cat { color: var(--primary); font-weight: 700; font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.03em; }
+        .recon-hdr { color: var(--text-dim); }
+        .recon-hdr-val { color: var(--text-main); word-break: break-all; }
+        .recon-purpose { color: var(--text-dim); font-style: italic; font-size: 0.9em; }
+
+        /* ── Path items ── */
+        .path-list { list-style: none; display: flex; flex-direction: column; gap: 3px; max-height: 260px; overflow-y: auto; }
+        .path-list::-webkit-scrollbar { width: 4px; }
+        .path-list::-webkit-scrollbar-track { background: transparent; }
+        .path-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        .path-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 6px;
+            border-radius: 4px;
+            font-size: 0.76em;
+            font-family: 'JetBrains Mono', monospace;
+            transition: background 0.1s;
+        }
+        .path-row:hover { background: var(--bg-hover); }
+        .path-row .status-pill { font-size: 0.68em; padding: 1px 6px; min-width: 28px; text-align: center; }
+        .path-name { color: var(--text-main); word-break: break-all; }
+        .path-bypass {
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 0.7em;
+            background: var(--accent-green-dim);
+            color: var(--accent-green);
+            border: 1px solid rgba(61,214,140,0.2);
+            white-space: nowrap;
+        }
+        .path-redir { color: var(--text-dim); margin-left: auto; font-size: 0.9em; white-space: nowrap; }
+
+        /* ── Empty / No Results ── */
+        .text-empty { color: var(--text-dim); }
+        .no-results {
+            padding: 48px;
+            text-align: center;
+            color: var(--text-dim);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+        }
+        .no-results svg { width: 40px; height: 40px; opacity: 0.4; }
+        .no-results a { color: var(--primary); cursor: pointer; text-decoration: underline; font-size: 0.85em; }
+
+        /* ── Scrollbar ── */
+        .table-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+        .table-scroll::-webkit-scrollbar-track { background: transparent; }
+        .table-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+        .table-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <div class="dashboard-header">
-        <div class="header-top">
-            <h1>Scan Results</h1>
-            <div class="meta-tag">{{ len .Results }} Targets Found</div>
+<div class="layout">
+    <div class="header">
+        <div class="header-left">
+            <div class="logo">W</div>
+            <h1>wScanner Report</h1>
         </div>
-        
-        <div class="filter-grid">
-            <div class="input-group">
-                <label>Text Search</label>
-                <input id="q" class="input" placeholder="Search URI, Title, Headers..." oninput="applyFilters()" />
-            </div>
-
-            <div class="input-group">
-                <label>Scheme</label>
-                <!-- Populated via JS for Uniqueness -->
-                <select id="scheme" class="input" onchange="applyFilters()">
-                    <option value="">All Schemes</option>
-                </select>
-            </div>
-
-            <div class="input-group">
-                <label>Port</label>
-                <!-- Populated via JS for Uniqueness -->
-                <select id="port" class="input" onchange="applyFilters()">
-                    <option value="">All Ports</option>
-                </select>
-            </div>
-
-            <div class="input-group">
-                <label>Status Code</label>
-                <select id="status" class="input" onchange="applyFilters()">
-                    <option value="">All Statuses</option>
-                    {{- range .StatusCodes }}
-                    <option value="{{.}}">{{.}}</option>
-                    {{- end }}
-                </select>
-            </div>
-
-            <div class="input-group">
-                <label>Server</label>
-                <select id="server" class="input" onchange="applyFilters()">
-                    <option value="">All Servers</option>
-                    {{- range .Servers }}
-                    <option value="{{.}}">{{.}}</option>
-                    {{- end }}
-                </select>
-            </div>
-
-            <div class="input-group">
-                <button class="input btn-reset" onclick="resetFilters()">Reset Filters</button>
-            </div>
-        </div>
+        <div class="stats" id="stats"></div>
     </div>
 
-    <div class="table-card">
-        <div class="table-container">
+    <div class="filters">
+        <input id="q" type="text" placeholder="Search targets, titles, headers..." oninput="applyFilters()" />
+        <select id="scheme" onchange="applyFilters()">
+            <option value="">All Schemes</option>
+        </select>
+        <select id="port" onchange="applyFilters()">
+            <option value="">All Ports</option>
+        </select>
+        <select id="status" onchange="applyFilters()">
+            <option value="">All Statuses</option>
+            {{- range .StatusCodes }}
+            <option value="{{.}}">{{.}}</option>
+            {{- end }}
+        </select>
+        <select id="server" onchange="applyFilters()">
+            <option value="">All Servers</option>
+            {{- range .Servers }}
+            <option value="{{.}}">{{.}}</option>
+            {{- end }}
+        </select>
+        <button class="btn-reset-filters" onclick="resetFilters()">Reset</button>
+        <span class="filter-count" id="filterCount"></span>
+    </div>
+
+    <div class="table-wrap">
+        <div class="table-scroll">
             <table id="results">
                 <thead>
                     <tr>
-                        <th style="width: 140px;">IP Address</th>
-                        <th style="width: 80px;">Port</th>
-                        <th style="width: 80px;">Scheme</th>
-                        <th>URI & Redirection</th>
-                        <th>Page Title</th>
-                        <th style="width: 100px;">Status</th>
+                        <th>Target</th>
+                        <th>Port</th>
+                        <th>Scheme</th>
+                        <th>URI</th>
+                        <th>Title</th>
+                        <th>Status</th>
                         <th>Server</th>
-                        <th style="width: 150px;">Meta</th>
-                        <th style="width: 160px;">DNS Info</th>
-                        <th style="width: 250px;">SSL Certificate</th>
-                        <th style="width: 350px;">Recon Data</th>
-                        <th style="width: 300px;">Discovered Paths</th>
+                        <th>Content</th>
+                        <th>DNS</th>
+                        <th>SSL</th>
+                        <th>Recon</th>
+                        <th>Paths</th>
                     </tr>
                 </thead>
                 <tbody>
                 {{- range $i, $r := .Results }}
-                <tr class="row" 
-                    data-status="{{$r.StatusCode}}" 
-                    data-server="{{$r.Server}}" 
+                <tr class="row"
+                    data-status="{{$r.StatusCode}}"
+                    data-server="{{$r.Server}}"
                     data-scheme="{{$r.TargetData.Scheme}}"
                     data-port="{{$r.TargetData.Port}}"
                     data-ip="{{$r.TargetData.IP}}">
-                    
-                    <td class="font-mono">
-                        <span class="target-ip">{{ $r.TargetData.IP }}</span>
-                    </td>
 
-                    <td class="font-mono">
-                        <span style="color:var(--text-muted);">{{ $r.TargetData.Port }}</span>
-                    </td>
+                    <td class="mono ip-cell">{{ $r.TargetData.IP }}</td>
+
+                    <td class="mono port-cell">{{ $r.TargetData.Port }}</td>
 
                     <td>
-                        <span class="badge badge-scheme">{{ $r.TargetData.Scheme }}</span>
+                        {{ if eq $r.TargetData.Scheme "https" }}
+                        <span class="scheme-badge scheme-https">HTTPS</span>
+                        {{ else if eq $r.TargetData.Scheme "http" }}
+                        <span class="scheme-badge scheme-http">HTTP</span>
+                        {{ else }}
+                        <span class="scheme-badge" style="background:var(--bg-card-alt);color:var(--text-dim);border:1px solid var(--border);">{{ $r.TargetData.Scheme }}</span>
+                        {{ end }}
                     </td>
 
-                    <td class="cell-uri font-mono">
-                        <a href="{{ $r.InitialURI }}" target="_blank" class="uri-main">{{ $r.InitialURI }}</a>
+                    <td class="mono">
+                        <a href="{{ $r.InitialURI }}" target="_blank" class="uri-link">{{ $r.InitialURI }}</a>
                         {{- if ne $r.RedirectURi "" }}
-                        <div class="redirect-flow">
-                            <span>↳</span> <span>{{ $r.RedirectURi }}</span>
+                        <div class="redirect-tag">
+                            <span class="arrow">↳</span> {{ $r.RedirectURi }}
                         </div>
                         {{- end }}
                     </td>
 
                     <td>
-                        <div style="font-weight:500;">
-                            {{ if ne $r.PageTitle "" }}
-                                {{ $r.PageTitle }}
-                            {{ else }}
-                                <span class="text-empty">No Title</span>
-                            {{ end }}
-                        </div>
+                        {{ if ne $r.PageTitle "" }}
+                        <div class="title-cell" title="{{ $r.PageTitle }}">{{ $r.PageTitle }}</div>
+                        {{ else }}
+                        <span class="text-empty">—</span>
+                        {{ end }}
                     </td>
 
                     <td>
-                        <span class="badge badge-status" data-status-val="{{ $r.StatusCode }}">{{ $r.StatusCode }}</span>
+                        <span class="status-pill" data-status-val="{{ $r.StatusCode }}">{{ $r.StatusCode }}</span>
                     </td>
 
                     <td>
                         {{- if ne $r.Server "" }}
-                        <span class="server-tag">{{ $r.Server }}</span>
+                        <span class="server-chip">{{ $r.Server }}</span>
                         {{- else }}
                         <span class="text-empty">—</span>
                         {{- end }}
                     </td>
 
-                    <td class="meta-info">
+                    <td class="meta-cell">
+                        {{- if ne $r.ContentType "" }}
                         <div>{{ $r.ContentType }}</div>
-                        <div style="margin-top:4px;">Size: {{ $r.ContentLength }}</div>
+                        {{- end }}
+                        {{- if ne $r.ContentLength "" }}
+                        <div><span class="label">Size:</span> {{ $r.ContentLength }}</div>
+                        {{- end }}
+                        {{- if and (eq $r.ContentType "") (eq $r.ContentLength "") }}
+                        <span class="text-empty">—</span>
+                        {{- end }}
                     </td>
 
-                    <td class="meta-info">
+                    <td class="dns-cell">
                         {{- if ne $r.CNAME "" }}
-                        <div><strong>CNAME:</strong> <span class="font-mono">{{ $r.CNAME }}</span></div>
+                        <div class="dns-row"><span class="dns-label">CNAME</span><span class="dns-val mono">{{ $r.CNAME }}</span></div>
                         {{- end }}
                         {{- if ne $r.PTR "" }}
-                        <div style="margin-top:4px;"><strong>PTR:</strong> <span class="font-mono">{{ $r.PTR }}</span></div>
+                        <div class="dns-row"><span class="dns-label">PTR</span><span class="dns-val mono">{{ $r.PTR }}</span></div>
                         {{- end }}
                         {{- if and (eq $r.CNAME "") (eq $r.PTR "") }}
                         <span class="text-empty">—</span>
                         {{- end }}
                     </td>
 
-                    <td class="meta-info">
+                    <td class="ssl-cell">
                         {{- if ne $r.SSLCommonName "" }}
-                        <div><strong>CN:</strong> <span class="font-mono">{{ $r.SSLCommonName }}</span></div>
+                        <div><span class="dns-label">CN</span> <span class="ssl-cn mono">{{ $r.SSLCommonName }}</span></div>
                         {{- end }}
                         {{- if gt (len $r.SSLSANs) 0 }}
-                        <div style="margin-top:4px;"><strong>SANs:</strong></div>
-                        <ul style="list-style:none;padding:0;margin:4px 0 0 0;">
+                        <ul class="ssl-san-list">
                         {{- range $r.SSLSANs }}
-                        <li class="font-mono" style="font-size:0.8em;color:var(--text-muted);">{{ . }}</li>
+                        <li class="ssl-san mono">{{ . }}</li>
                         {{- end }}
                         </ul>
                         {{- end }}
@@ -460,17 +502,9 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                         {{- if gt (len $r.ReconInfo) 0 }}
                         <ul class="recon-list">
                         {{- range $r.ReconInfo }}
-                        <li class="recon-item">
-                            <div class="recon-header">
-                                <div>
-                                    <span class="recon-cat">{{ .CategoryName }}</span>
-                                    <span class="recon-purpose">{{ .Purpose }}</span>
-                                </div>
-                            </div>
-                            <div>
-                                <span class="recon-key">{{ .HeaderName }}:</span>
-                                <span class="recon-val">{{ .HeaderValue }}</span>
-                            </div>
+                        <li class="recon-chip">
+                            <div><span class="recon-cat">{{ .CategoryName }}</span> <span class="recon-purpose">{{ .Purpose }}</span></div>
+                            <div><span class="recon-hdr">{{ .HeaderName }}:</span> <span class="recon-hdr-val">{{ .HeaderValue }}</span></div>
                         </li>
                         {{- end }}
                         </ul>
@@ -483,14 +517,14 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                         {{- if gt (len $r.PathResults) 0 }}
                         <ul class="path-list">
                         {{- range $r.PathResults }}
-                        <li class="path-item">
-                            <span class="badge badge-status" data-status-val="{{ .StatusCode }}">{{ .StatusCode }}</span>
+                        <li class="path-row">
+                            <span class="status-pill" data-status-val="{{ .StatusCode }}">{{ .StatusCode }}</span>
                             <span class="path-name">{{ .Path }}</span>
                             {{- if ne .BypassMethod "" }}
-                            <span class="badge" style="background:#dcfce7;color:#166534;font-size:0.65em;margin-left:4px;">BYPASS: {{ .BypassMethod }}</span>
+                            <span class="path-bypass">{{ .BypassMethod }}</span>
                             {{- end }}
                             {{- if ne .RedirectURL "" }}
-                            <span class="path-redirect">→ {{ .RedirectURL }}</span>
+                            <span class="path-redir">→ {{ .RedirectURL }}</span>
                             {{- end }}
                         </li>
                         {{- end }}
@@ -504,117 +538,106 @@ func GenerateHTMLReport(results ResponseResultList) (string, error) {
                 </tbody>
             </table>
         </div>
-        
+
         <div id="none" class="no-results" style="display:none">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
-            <div>No matching results found</div>
-            <button onclick="resetFilters()" style="color:var(--primary); background:none; border:none; cursor:pointer; text-decoration:underline;">Clear filters</button>
+            <div>No matching results</div>
+            <a onclick="resetFilters()">Clear filters</a>
         </div>
     </div>
 </div>
 
 <script>
-// 1. Populate Dropdowns Dynamically (Fixes Uniqueness Issue)
-function populateDropdowns() {
-    const rows = document.querySelectorAll('#results tbody tr');
-    const schemes = new Set();
-    const ports = new Set();
-
-    // Collect unique values
-    rows.forEach(row => {
-        const s = row.getAttribute('data-scheme');
-        const p = row.getAttribute('data-port');
-        if (s) schemes.add(s);
-        if (p) ports.add(p);
+// 1. Stats bar
+(function buildStats() {
+    var rows = document.querySelectorAll('#results tbody tr');
+    var total = rows.length;
+    var s2=0, s3=0, s4=0, s5=0;
+    rows.forEach(function(r) {
+        var c = parseInt(r.getAttribute('data-status'));
+        if (c >= 200 && c < 300) s2++;
+        else if (c >= 300 && c < 400) s3++;
+        else if (c >= 400 && c < 500) s4++;
+        else if (c >= 500) s5++;
     });
+    var html = '<div class="stat-chip"><span>Total</span> <span class="val">' + total + '</span></div>';
+    if (s2) html += '<div class="stat-chip stat-2xx"><span>2xx</span> <span class="val">' + s2 + '</span></div>';
+    if (s3) html += '<div class="stat-chip stat-3xx"><span>3xx</span> <span class="val">' + s3 + '</span></div>';
+    if (s4) html += '<div class="stat-chip stat-4xx"><span>4xx</span> <span class="val">' + s4 + '</span></div>';
+    if (s5) html += '<div class="stat-chip stat-5xx"><span>5xx</span> <span class="val">' + s5 + '</span></div>';
+    document.getElementById('stats').innerHTML = html;
+})();
 
-    // Helper to add options
-    const addOptions = (id, set, isNumeric) => {
-        const select = document.getElementById(id);
-        const array = Array.from(set);
-        
-        // Sort: Numbers numeric, Strings alphabetical
-        if (isNumeric) {
-            array.sort((a, b) => parseInt(a) - parseInt(b));
-        } else {
-            array.sort();
-        }
-
-        array.forEach(val => {
-            const opt = document.createElement('option');
-            opt.value = val;
-            opt.textContent = val;
-            select.appendChild(opt);
+// 2. Populate dropdown filters dynamically
+(function populateDropdowns() {
+    var rows = document.querySelectorAll('#results tbody tr');
+    var schemes = {}, ports = {};
+    rows.forEach(function(r) {
+        var s = r.getAttribute('data-scheme');
+        var p = r.getAttribute('data-port');
+        if (s) schemes[s] = 1;
+        if (p) ports[p] = 1;
+    });
+    function addOpts(id, obj, numeric) {
+        var sel = document.getElementById(id);
+        var arr = Object.keys(obj);
+        if (numeric) arr.sort(function(a,b){ return parseInt(a)-parseInt(b); });
+        else arr.sort();
+        arr.forEach(function(v) {
+            var o = document.createElement('option');
+            o.value = v; o.textContent = v;
+            sel.appendChild(o);
         });
-    };
+    }
+    addOpts('scheme', schemes, false);
+    addOpts('port', ports, true);
+})();
 
-    addOptions('scheme', schemes, false);
-    addOptions('port', ports, true);
-}
-
-// 2. Colorize status codes
-function colorizeStatus() {
-    document.querySelectorAll('.badge-status').forEach(el => {
-        const code = parseInt(el.getAttribute('data-status-val'));
-        if (code >= 200 && code < 300) el.classList.add('status-2xx');
-        else if (code >= 300 && code < 400) el.classList.add('status-3xx');
-        else if (code >= 400 && code < 500) el.classList.add('status-4xx');
-        else if (code >= 500) el.classList.add('status-5xx');
+// 3. Colorize status pills
+(function colorize() {
+    document.querySelectorAll('.status-pill').forEach(function(el) {
+        var c = parseInt(el.getAttribute('data-status-val'));
+        if (c >= 200 && c < 300) el.classList.add('status-2xx');
+        else if (c >= 300 && c < 400) el.classList.add('status-3xx');
+        else if (c >= 400 && c < 500) el.classList.add('status-4xx');
+        else if (c >= 500) el.classList.add('status-5xx');
     });
-}
+})();
 
-// 3. Filter Logic - Helpers
-function normalize(s){ return s ? String(s).toLowerCase().trim() : ""; }
+// 4. Filtering
+function norm(s) { return s ? String(s).toLowerCase().trim() : ""; }
 
-function applyFilters(){
-    // Get values from inputs
-    var q = normalize(document.getElementById('q').value);
-    var scheme = normalize(document.getElementById('scheme').value);
-    var port = normalize(document.getElementById('port').value);
-    var status = normalize(document.getElementById('status').value);
-    var server = normalize(document.getElementById('server').value);
+function applyFilters() {
+    var q = norm(document.getElementById('q').value);
+    var scheme = norm(document.getElementById('scheme').value);
+    var port = norm(document.getElementById('port').value);
+    var status = norm(document.getElementById('status').value);
+    var server = norm(document.getElementById('server').value);
+    var rows = document.querySelectorAll('#results tbody tr');
+    var shown = 0, total = rows.length;
 
-    var rows = Array.from(document.querySelectorAll('#results tbody tr'));
-    var shown = 0;
-
-    rows.forEach(function(r){
-        var text = normalize(r.textContent);
-        
-        // Data Attributes 
-        var rowScheme = normalize(r.getAttribute('data-scheme'));
-        var rowPort = normalize(r.getAttribute('data-port'));
-        var rowStatus = normalize(r.getAttribute('data-status'));
-        var rowServer = normalize(r.getAttribute('data-server'));
-
-        // Check Matches
-        var matchesQ = q === '' || text.indexOf(q) !== -1;
-        var matchesScheme = scheme === '' || rowScheme === scheme;
-        var matchesPort = port === '' || rowPort === port;
-        var matchesStatus = status === '' || rowStatus === status;
-        var matchesServer = server === '' || rowServer === server;
-
-        if(matchesQ && matchesScheme && matchesPort && matchesStatus && matchesServer){
-            r.style.display = '';
-            shown++;
-        } else { 
-            r.style.display = 'none'; 
-        }
+    rows.forEach(function(r) {
+        var text = norm(r.textContent);
+        var ok = (q === '' || text.indexOf(q) !== -1)
+              && (scheme === '' || norm(r.getAttribute('data-scheme')) === scheme)
+              && (port === '' || norm(r.getAttribute('data-port')) === port)
+              && (status === '' || norm(r.getAttribute('data-status')) === status)
+              && (server === '' || norm(r.getAttribute('data-server')) === server);
+        r.style.display = ok ? '' : 'none';
+        if (ok) shown++;
     });
-    
+
     document.getElementById('none').style.display = shown === 0 ? 'flex' : 'none';
     document.getElementById('results').style.display = shown === 0 ? 'none' : 'table';
+    document.getElementById('filterCount').textContent = shown < total ? shown + ' / ' + total : '';
 }
 
-function resetFilters(){ 
-    document.querySelectorAll('input.input, select.input').forEach(i => i.value = '');
-    applyFilters(); 
+function resetFilters() {
+    document.querySelectorAll('.filters input, .filters select').forEach(function(i){ i.value = ''; });
+    applyFilters();
 }
-
-// Initialize
-populateDropdowns();
-colorizeStatus();
 </script>
 </body>
 </html>`

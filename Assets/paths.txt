@@ -12,6 +12,8 @@ bitbucket-pipelines.yml
 azure-pipelines.yml
 circleci/config.yml
 appveyor.yml
+phppgadmin
+phpadmin
 buildspec.yml
 cloudbuild.yaml
 Dockerfile
