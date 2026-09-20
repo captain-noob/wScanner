@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -35,6 +36,13 @@ func openICMPConn() (*icmp.PacketConn, bool, error) {
 // The second return value is false when no ICMP socket could be opened at all —
 // the caller should then fall back to another method. Non-IPv4 / unresolvable
 // hosts are ignored here (the dispatcher routes those elsewhere).
+//
+// The reader runs concurrently with (and continues past) the send loop so replies
+// are drained as they arrive rather than piling up in the socket buffer, and the
+// reply-window deadline is set AFTER the send loop so every host — including those
+// pinged last in a large sweep — gets the full timeout to answer. Sends are
+// retried on transient buffer-full errors, and any residual send failures are
+// surfaced (never silently dropped) so a big sweep cannot quietly misreport hosts.
 func icmpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool) {
 	conn, isDatagram, err := openICMPConn()
 	if err != nil {
@@ -65,22 +73,21 @@ func icmpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool)
 	live := make(map[string]bool)
 	var mu sync.Mutex
 
-	// Reader: collect echo replies until the deadline elapses.
+	// Reader: drain echo replies continuously. No deadline is set here — the
+	// send loop sets it once all requests are out, giving every host a full
+	// reply window. Reading during the send phase also keeps the socket receive
+	// buffer from overflowing on large sweeps.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		buf := make([]byte, 1500)
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		for {
 			n, peer, rerr := conn.ReadFrom(buf)
 			if rerr != nil {
-				return // deadline or closed
+				return // deadline reached or socket closed
 			}
 			rm, perr := icmp.ParseMessage(icmpProtocolNumber, buf[:n])
-			if perr != nil {
-				continue
-			}
-			if rm.Type != ipv4.ICMPTypeEchoReply {
+			if perr != nil || rm.Type != ipv4.ICMPTypeEchoReply {
 				continue
 			}
 			peerIP := addrIP(peer)
@@ -95,8 +102,10 @@ func icmpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool)
 		}
 	}()
 
-	// Send one echo request per host.
+	// Send one echo request per host, retrying briefly on transient buffer-full
+	// errors (ENOBUFS/EAGAIN) instead of silently losing the probe.
 	id := os.Getpid() & 0xffff
+	var sendFailures int
 	for i, d := range dsts {
 		wm := icmp.Message{
 			Type: ipv4.ICMPTypeEcho,
@@ -113,14 +122,36 @@ func icmpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool)
 		} else {
 			to = &net.IPAddr{IP: d.ip}
 		}
-		_, _ = conn.WriteTo(wb, to)
+		if !sendWithRetry(func() error { _, e := conn.WriteTo(wb, to); return e }) {
+			sendFailures++
+		}
 	}
 
+	// Now that every request is out, give replies the full timeout window.
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	<-done
+
+	if sendFailures > 0 {
+		fmt.Printf("%s[!]%s ICMP: %d/%d probes could not be sent (buffer limits) — some hosts may be under-reported; consider a smaller range or -discovery-method tcp\n",
+			Yellow, Reset, sendFailures, len(dsts))
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	return live, true
+}
+
+// sendWithRetry runs send up to 3 times, backing off briefly on error to ride
+// out transient buffer-full conditions (ENOBUFS/EAGAIN) under a fast send burst.
+// Returns true if a send eventually succeeded.
+func sendWithRetry(send func() error) bool {
+	for attempt := 0; attempt < 3; attempt++ {
+		if send() == nil {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
 }
 
 // resolveIPv4 returns the IPv4 address for a host string (IP or hostname), or

@@ -5,14 +5,23 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// htons converts a uint16 from host to network byte order.
-func htons(v uint16) uint16 { return (v<<8)&0xff00 | (v>>8)&0x00ff }
+// htons converts a uint16 from host to network (big-endian) byte order. It is a
+// no-op on big-endian hosts and a swap on little-endian ones — implemented via
+// encoding/binary so it is correct on every architecture the linux build tag
+// covers (amd64/arm64 little-endian, s390x/mips big-endian).
+func htons(v uint16) uint16 {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	return binary.NativeEndian.Uint16(b[:])
+}
 
 // arpAvailable reports whether ARP discovery can run: Linux with permission to
 // open an AF_PACKET raw socket (root or CAP_NET_RAW).
@@ -86,6 +95,10 @@ func buildARPRequest(src *arpIface, tpa net.IP) []byte {
 // arpDiscover ARP-pings the given (ideally local-subnet, IPv4) hosts and returns
 // the set that replied. ok=false means ARP could not be used at all (no
 // permission / no suitable interface), so the caller should fall back.
+//
+// A reader goroutine drains replies concurrently with the send loop so answers
+// are not lost to a full socket buffer while requests are still going out, and
+// sends are retried on transient buffer-full errors.
 func arpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool) {
 	// Group hosts by the interface that can reach them; map target IP -> host.
 	type group struct {
@@ -119,15 +132,54 @@ func arpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool) 
 	}
 	defer unix.Close(fd)
 
-	// Short receive timeout so the read loop can re-check the overall deadline.
+	// Short receive timeout so the reader can re-check the stop signal.
 	tv := unix.Timeval{Sec: 0, Usec: 200000}
 	_ = unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
 
 	live := make(map[string]bool)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
 
+	// Reader: consume ARP replies until stopped. It owns `live`; the caller
+	// only reads it after wg.Wait(), so no additional locking is needed.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 1500)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			n, _, rerr := unix.Recvfrom(fd, buf, 0)
+			if rerr != nil {
+				continue // EAGAIN from SO_RCVTIMEO — loop and re-check stop
+			}
+			if n < 42 { // 14 (eth) + 28 (arp)
+				continue
+			}
+			if binary.BigEndian.Uint16(buf[12:14]) != 0x0806 { // ethertype ARP
+				continue
+			}
+			if binary.BigEndian.Uint16(buf[20:22]) != 2 { // ARP reply
+				continue
+			}
+			senderIP := net.IP(buf[28:32]).String()
+			for _, g := range byIface {
+				if h, ok := g.targets[senderIP]; ok {
+					live[h] = true
+				}
+			}
+		}
+	}()
+
+	// Send an ARP request for every target, retrying on transient buffer-full.
+	total := 0
+	var sendFailures int
 	for _, g := range byIface {
-		// Send an ARP request for every target on this interface.
 		for ipStr := range g.targets {
+			total++
 			frame := buildARPRequest(g.ifi, net.ParseIP(ipStr))
 			sa := &unix.SockaddrLinklayer{
 				Protocol: htons(unix.ETH_P_ARP),
@@ -135,36 +187,20 @@ func arpDiscover(hosts []string, timeout time.Duration) (map[string]bool, bool) 
 				Halen:    6,
 				Addr:     [8]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
 			}
-			_ = unix.Sendto(fd, frame, 0, sa)
+			if !sendWithRetry(func() error { return unix.Sendto(fd, frame, 0, sa) }) {
+				sendFailures++
+			}
 		}
 	}
 
-	// Read replies until the overall deadline.
-	deadline := time.Now().Add(timeout)
-	buf := make([]byte, 1500)
-	for time.Now().Before(deadline) {
-		n, _, rerr := unix.Recvfrom(fd, buf, 0)
-		if rerr != nil {
-			// EAGAIN/EWOULDBLOCK from the recv timeout — keep polling until deadline.
-			continue
-		}
-		if n < 42 { // 14 (eth) + 28 (arp)
-			continue
-		}
-		// ethertype ARP?
-		if binary.BigEndian.Uint16(buf[12:14]) != 0x0806 {
-			continue
-		}
-		// ARP opcode reply == 2?
-		if binary.BigEndian.Uint16(buf[20:22]) != 2 {
-			continue
-		}
-		senderIP := net.IP(buf[28:32]).String()
-		for _, g := range byIface {
-			if h, ok := g.targets[senderIP]; ok {
-				live[h] = true
-			}
-		}
+	// Let replies arrive, then stop the reader.
+	time.Sleep(timeout)
+	close(stop)
+	wg.Wait()
+
+	if sendFailures > 0 {
+		fmt.Printf("%s[!]%s ARP: %d/%d requests could not be sent (buffer limits) — some hosts may be under-reported\n",
+			Yellow, Reset, sendFailures, total)
 	}
 
 	return live, true
