@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math/rand"
@@ -48,7 +49,7 @@ const intrestingPaths = "https://raw.githubusercontent.com/captain-noob/wScanner
 
 var folderName = "wScanner_" + time.Now().Format("20060102_150405")
 
-var isProgressBarCompleted = false
+var isProgressBarCompleted atomic.Bool
 var activeGoroutines int64
 
 // Global error logger — initialized in main() after output folder is created.
@@ -71,34 +72,10 @@ var (
 	selfUpdate   = flag.Bool("update", false, "Self-update wScanner to the **latest** GitHub release.")
 	forceCFScan  = flag.Bool("force-cf", false, "Force port scanning even for **Cloudflare** IPs.")
 	maxRetries   = flag.Int("retries", 2, "Number of **retries** for failed HTTP requests (transport errors only).")
+	enableFuzz   = flag.Bool("fuzz", false, "Enable **directory/path fuzzing** (disabled by default; auto-enabled when -path is given).")
+	skipDisco    = flag.Bool("skip-discovery", false, "Scan **every host** in a CIDR/range without host-discovery pre-filtering.")
+	discoPorts   = flag.String("discovery-ports", "80,443,22,8080,8443,3389,445,21,25,3306", "Comma-separated ports used for TCP **host discovery** on CIDR/range inputs.")
 )
-
-// CSV columns
-var csvHeaders = []string{
-	"target",
-	"port",
-	"scheme",
-	"status_code",
-	"content_length",
-	"content_type",
-	"redirect_location",
-	"favicon_mmh3",
-	"response_time_ms",
-	"body_line_count",
-	"body_word_count",
-	"page_title",
-	"server",
-	"technologies",
-	"http_method",
-	"websocket_capable",
-	"ip",
-	"asn",
-	"cdn_waf",
-	"cname",
-	"ptr",
-	"ssl_cn",
-	"ssl_sans",
-}
 
 // Cloudflare IP ranges (populated by init)
 var cloudflareIPv4CIDRs []*net.IPNet
@@ -301,18 +278,32 @@ func checkAndDownloadAssets() bool {
 		}
 	}
 
-	// Download paths wordlist
+	// Download paths wordlist — only needed when fuzzing is requested
+	// (-fuzz or a custom -path). Skipping it otherwise avoids a wasted fetch.
 	pathsPath := assetDir + "paths.txt"
-	if _, err := os.Stat(pathsPath); os.IsNotExist(err) || *updateConfig {
-		fmt.Printf("%s[+] Downloading paths wordlist...%s\n", Cyan, Reset)
-		err := downloadFile(intrestingPaths, pathsPath)
-		if err != nil {
-			fmt.Printf("%s[!] Warning:%s Failed to download paths file: %v\n", Yellow, Reset, err)
-			// Not fatal — fuzzing is optional
+	wantFuzz := *enableFuzz || *pathFile != ""
+	if wantFuzz {
+		if _, err := os.Stat(pathsPath); os.IsNotExist(err) || *updateConfig {
+			fmt.Printf("%s[+] Downloading paths wordlist...%s\n", Cyan, Reset)
+			err := downloadFile(intrestingPaths, pathsPath)
+			if err != nil {
+				fmt.Printf("%s[!] Warning:%s Failed to download paths file: %v\n", Yellow, Reset, err)
+				// Not fatal — fuzzing is optional
+			}
 		}
 	}
 
+	// Point at the cached asset copies by default. An explicit -ports-file
+	// override (anything other than the "ports.txt" default) that exists on
+	// disk is respected so users can supply their own port list directly.
 	pPath := portsPath
+	if *portsFile != "" && *portsFile != "ports.txt" {
+		if _, statErr := os.Stat(*portsFile); statErr == nil {
+			pPath = *portsFile
+		} else {
+			fmt.Printf("%s[!] Warning:%s -ports-file '%s' not found — using cached ports list\n", Yellow, Reset, *portsFile)
+		}
+	}
 	portsFile = &pPath
 	uPath := uaPath
 	userAgentsFile = &uPath
@@ -363,7 +354,7 @@ func (pb *ProgressBar) Update(step int) {
 	// Now, only one goroutine can execute the following code block at a time
 
 	pb.Current += step
-	isProgressBarCompleted = false
+	isProgressBarCompleted.Store(false)
 	if pb.Current > pb.Total {
 		pb.Current = pb.Total
 	}
@@ -396,7 +387,7 @@ func (pb *ProgressBar) Update(step int) {
 
 	if pb.Current == pb.Total {
 		fmt.Println()
-		isProgressBarCompleted = true
+		isProgressBarCompleted.Store(true)
 	}
 }
 
@@ -468,9 +459,16 @@ func getMaxThreads() int {
 	return maxThreads
 }
 
+// maxConcurrencyCap bounds an explicit -c so an absurd value cannot try to
+// spawn millions of goroutines (e.g. -c 20000000 against a large expanded CIDR).
+const maxConcurrencyCap = 65536
+
 func getConcurrencyLimit() int {
-	// If user specified -c, use it directly (no cap).
+	// If user specified -c, use it directly, clamped to a sane ceiling.
 	if *concurrency > 0 {
+		if *concurrency > maxConcurrencyCap {
+			return maxConcurrencyCap
+		}
 		return *concurrency
 	}
 	// Cross-platform: derive from CPU count instead of bash ulimit
@@ -491,7 +489,12 @@ func newRPSThrottle() (throttle func(), stop func()) {
 	if *maxRPS <= 0 {
 		return func() {}, func() {}
 	}
+	// Integer division: an -rps above 1e9 makes interval 0, and time.NewTicker
+	// panics on a non-positive interval. Floor it at 1ns (effectively unlimited).
 	interval := time.Second / time.Duration(*maxRPS)
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
 	ticker := time.NewTicker(interval)
 	return func() { <-ticker.C }, ticker.Stop
 }
@@ -500,8 +503,12 @@ func detectScheme(host string, port string) string {
 	address := net.JoinHostPort(host, port)
 	// Use a capped per-attempt timeout of 5 seconds for scheme detection
 	schemeTimeout := 5 * time.Second
+	// Only tighten toward the user timeout when it is positive — a 0/negative
+	// -timeout would otherwise become a zero timeout, which net/http treats as
+	// "no timeout" and would hang scheme detection on filtered hosts. (main()
+	// also clamps -timeout at startup; this is defense-in-depth.)
 	userTimeout := time.Duration(*time_out) * time.Second
-	if userTimeout < schemeTimeout {
+	if userTimeout > 0 && userTimeout < schemeTimeout {
 		schemeTimeout = userTimeout
 	}
 
@@ -671,8 +678,15 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 		Port string
 	}
 
-	jobs := make(chan targetItem, maxtotalJobs)
-	results := make(chan ScanResult, maxtotalJobs) // Perf #7: carry scheme in result
+	// Bounded channels + a streaming feeder (below) so a large CIDR sweep
+	// (e.g. a /16 across every port = millions of jobs) does not pre-allocate
+	// one buffer slot per job and exhaust memory.
+	chanBuf := maxtotalJobs
+	if chanBuf > 8192 {
+		chanBuf = 8192
+	}
+	jobs := make(chan targetItem, chanBuf)
+	results := make(chan ScanResult, chanBuf) // Perf #7: carry scheme in result
 
 	var wg sync.WaitGroup
 
@@ -707,17 +721,20 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 		}()
 	}
 
-	// Send jobs (rate-limited if -rps is set)
+	// Feed jobs from a goroutine so the main goroutine can drain results
+	// concurrently — required now that the channels are bounded (otherwise a
+	// full results buffer would block every worker before we start reading).
 	throttle, stopThrottle := newRPSThrottle()
-	defer stopThrottle()
-	for _, target := range filteredTargets {
-		for _, port := range ports {
-			throttle()
-			jobs <- targetItem{IP: target, Port: port}
+	go func() {
+		for _, target := range filteredTargets {
+			for _, port := range ports {
+				throttle()
+				jobs <- targetItem{IP: target, Port: port}
+			}
 		}
-	}
-
-	close(jobs)
+		close(jobs)
+		stopThrottle()
+	}()
 
 	go func() {
 		wg.Wait()
@@ -733,7 +750,7 @@ func probeTargets(targets []string, ports []string) ScanResultList {
 	}
 
 	for r := range results {
-		if isProgressBarCompleted {
+		if isProgressBarCompleted.Load() {
 			fmt.Printf("\r%s%s [*] %sWaiting for all goroutines to complete: %s[%d] left%s   ",
 				Cyan, Bold,
 				Reset,
@@ -872,16 +889,22 @@ func getResponse(item ScanResult) ResponseResult {
 		resp = resp2
 	}
 
+	// Only report a redirect when the final URL actually differs from what we
+	// requested — otherwise "Redirect URI" just echoes the initial URI and is
+	// noise. resp.Request.URL is the last URL in the redirect chain.
 	targetRedirect := ""
-	if resp.Request.URL.String() != "" {
-		targetRedirect = resp.Request.URL.String()
+	if finalURL := resp.Request.URL.String(); finalURL != "" && finalURL != InitialURI {
+		targetRedirect = finalURL
 	}
 
-	re := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
+	// (?is): case-insensitive + let '.' span newlines so multi-line <title>
+	// tags are captured. Decode HTML entities and collapse whitespace so the
+	// reported title matches what a browser shows.
+	re := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 	page_title := ""
 	matches := re.FindStringSubmatch(string(body))
 	if len(matches) > 1 {
-		page_title = matches[1]
+		page_title = strings.TrimSpace(html.UnescapeString(strings.Join(strings.Fields(matches[1]), " ")))
 	}
 
 	// Bug #6: Use cached header config instead of re-reading file on every response
@@ -948,7 +971,13 @@ func getResponse(item ScanResult) ResponseResult {
 	outx.StatusCode = strconv.Itoa(resp.StatusCode)
 	outx.ContentType = resp.Header.Get("Content-Type")
 	outx.Server = resp.Header.Get("Server")
+	// Content-Length header is frequently absent on chunked or compressed
+	// responses. Fall back to the actual number of bytes read so the reported
+	// length is always accurate.
 	outx.ContentLength = resp.Header.Get("Content-Length")
+	if outx.ContentLength == "" {
+		outx.ContentLength = strconv.Itoa(len(body))
+	}
 
 	return outx
 }
@@ -1227,8 +1256,16 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		Result    FuzzResult
 	}
 
-	jobs := make(chan fuzzJob, totalJobs)
-	resultsCh := make(chan fuzzOut, totalJobs)
+	// Bounded channels + a streaming feeder (below): totalJobs is the product
+	// validTargets*len(paths), which for many discovered services against a
+	// large wordlist can be tens of millions — buffering one slot per job would
+	// OOM before a single request is sent (same hazard fixed in probeTargets).
+	fuzzChanBuf := totalJobs
+	if fuzzChanBuf > 8192 {
+		fuzzChanBuf = 8192
+	}
+	jobs := make(chan fuzzJob, fuzzChanBuf)
+	resultsCh := make(chan fuzzOut, fuzzChanBuf)
 
 	var wg sync.WaitGroup
 
@@ -1357,24 +1394,28 @@ func fuzzPaths(results ResponseResultList, paths []string) ResponseResultList {
 		}()
 	}
 
-	// Send jobs (rate-limited if -rps is set)
+	// Feed jobs from a goroutine so results are drained concurrently — required
+	// now that resultsCh is bounded (workers would otherwise block on a full
+	// resultsCh before the main goroutine finished enqueuing all jobs).
 	throttle, stopThrottle := newRPSThrottle()
-	defer stopThrottle()
-	for idx, r := range results {
-		if len(r.TargetData.Scheme) < 1 {
-			continue
-		}
-		baseURL := fmt.Sprintf("%s://%s:%s", r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port)
-		for _, p := range paths {
-			p = strings.TrimSpace(p)
-			if p == "" {
+	go func() {
+		for idx, r := range results {
+			if len(r.TargetData.Scheme) < 1 {
 				continue
 			}
-			throttle()
-			jobs <- fuzzJob{ResultIdx: idx, BaseURL: baseURL, Path: p}
+			baseURL := fmt.Sprintf("%s://%s:%s", r.TargetData.Scheme, r.TargetData.IP, r.TargetData.Port)
+			for _, p := range paths {
+				p = strings.TrimSpace(p)
+				if p == "" {
+					continue
+				}
+				throttle()
+				jobs <- fuzzJob{ResultIdx: idx, BaseURL: baseURL, Path: p}
+			}
 		}
-	}
-	close(jobs)
+		close(jobs)
+		stopThrottle()
+	}()
 
 	go func() {
 		wg.Wait()
@@ -2310,6 +2351,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// A non-positive -timeout becomes a zero timeout on net/http clients and
+	// dialers, which means "no timeout" — probes would hang on filtered hosts.
+	// Clamp it to the default so every downstream timeout stays bounded.
+	if *time_out <= 0 {
+		fmt.Printf("%s[!] Warning:%s -timeout must be > 0 seconds; using default 15s\n", Yellow, Reset)
+		*time_out = 15
+	}
+
 	// Banner / Internet Check
 
 	if CheckInternet() {
@@ -2348,9 +2397,17 @@ func main() {
 	}
 
 	// --- Initialization ---
-	ports, err := readInputFile(*portsFile)
+	rawPorts, err := readInputFile(*portsFile)
 	if err != nil {
 		fmt.Printf("%s[!] Error reading ports file:%s %v\n", Red, Reset, err)
+		os.Exit(1)
+	}
+	// Trim blanks and drop out-of-range entries so a stray blank line is not
+	// dialed as "host:" and an empty/garbage ports file fails loudly instead of
+	// silently reporting "0 open ports".
+	ports := sanitizePorts(rawPorts)
+	if len(ports) == 0 {
+		fmt.Printf("%s[!] Error:%s ports file '%s' contains no valid ports (1-65535)\n", Red, Reset, *portsFile)
 		os.Exit(1)
 	}
 
@@ -2387,15 +2444,37 @@ func main() {
 	}
 
 	// --- Build targets list ---
-	var targets []string
+	var rawTargets []string
 	if *inputFile != "" {
-		targets, err = readInputFile(*inputFile)
+		rawTargets, err = readInputFile(*inputFile)
 		if err != nil {
 			fmt.Printf("%s[!] Error reading input file:%s %v\n", Red, Reset, err)
 			os.Exit(1)
 		}
 	} else if *host != "" {
-		targets = []string{*host}
+		rawTargets = []string{*host}
+	}
+
+	// Expand any CIDR blocks / dash ranges into individual hosts. When an
+	// expansion happens we optionally run a fast TCP host-discovery pass so
+	// only live hosts are port-scanned (skippable with -skip-discovery).
+	targets, didExpand := expandTargets(rawTargets)
+	if len(targets) == 0 {
+		fmt.Printf("%s[!] Error:%s No valid targets after parsing input\n", Red, Reset)
+		os.Exit(1)
+	}
+	if didExpand {
+		fmt.Printf("%s[*]%s Expanded input to %s%d%s hosts\n", Cyan, Reset, Bold, len(targets), Reset)
+	}
+	if didExpand && !*skipDisco && state.CompletedPhase < PhasePortScan {
+		live := discoverLiveHosts(targets, parseDiscoveryPorts(*discoPorts))
+		if len(live) == 0 {
+			fmt.Printf("%s[!]%s No live hosts found during discovery. Use %s-skip-discovery%s to scan all hosts anyway.\n",
+				Yellow, Reset, Bold, Reset)
+			ClearState(folderName)
+			os.Exit(0)
+		}
+		targets = live
 	}
 
 	// Store targets & ports in state for resume validation
@@ -2435,28 +2514,27 @@ func main() {
 			fmt.Printf("%s[*]%s Recovered %s%d%s open ports from previous interrupted scan\n",
 				Cyan, Reset, Bold, len(partialPorts), Reset)
 			openPorts = partialPorts
-		} else {
-			if *inputFile != "" {
-				fmt.Printf("%s[*]%s Start scanning on %s%d%s targets from : %s\n", Cyan, Reset, Bold, len(targets), Reset, *inputFile)
-				openPorts = probeTargets(targets, ports)
-			} else if *host != "" {
-				// Single target — check Cloudflare
-				if isCloudflareIP(*host) {
-					cloudflareSkipped = append(cloudflareSkipped, *host)
-					if !*forceCFScan {
-						fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Skipping port scan.%s (use -force-cf to override)\n",
-							Yellow, *host, Reset)
-					} else {
-						fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Force scanning enabled.%s\n",
-							Yellow, *host, Reset)
-						fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, *host, Reset)
-						openPorts = probePorts(*host, ports)
-					}
+		} else if len(targets) == 1 {
+			// Single target — check Cloudflare
+			single := targets[0]
+			if isCloudflareIP(single) {
+				cloudflareSkipped = append(cloudflareSkipped, single)
+				if !*forceCFScan {
+					fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Skipping port scan.%s (use -force-cf to override)\n",
+						Yellow, single, Reset)
 				} else {
-					fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, *host, Reset)
-					openPorts = probePorts(*host, ports)
+					fmt.Printf("%s[!] Target '%s' belongs to Cloudflare → Force scanning enabled.%s\n",
+						Yellow, single, Reset)
+					fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, single, Reset)
+					openPorts = probePorts(single, ports)
 				}
+			} else {
+				fmt.Printf("%s[*]%s Start scanning on single target: %s%s%s\n", Cyan, Reset, Bold, single, Reset)
+				openPorts = probePorts(single, ports)
 			}
+		} else {
+			fmt.Printf("%s[*]%s Start scanning on %s%d%s targets\n", Cyan, Reset, Bold, len(targets), Reset)
+			openPorts = probeTargets(targets, ports)
 		}
 
 		fmt.Printf("\n%s[+]%s Port scan complete. %s%d%s open ports found.\n", Green, Reset, Bold, len(openPorts), Reset)
@@ -2518,20 +2596,26 @@ func main() {
 		fmt.Printf("%s[*]%s Skipping re-check (already completed)\n", Cyan, Reset)
 	}
 
-	// Phase 5: Path Fuzzing
+	// Phase 5: Path Fuzzing — opt-in. Runs only when -fuzz is set or a custom
+	// -path wordlist is supplied (which implies intent to fuzz).
+	fuzzEnabled := *enableFuzz || *pathFile != ""
 	if state.CompletedPhase < PhaseFuzz {
-		// Determine which path wordlist to use
-		pathWordlist := *pathsFile // default from assets
-		if *pathFile != "" {
-			pathWordlist = *pathFile // user override
-		}
+		if !fuzzEnabled {
+			fmt.Printf("%s[*]%s Directory fuzzing disabled (enable with %s-fuzz%s)\n", Cyan, Reset, Bold, Reset)
+		} else {
+			// Determine which path wordlist to use
+			pathWordlist := *pathsFile // default from assets
+			if *pathFile != "" {
+				pathWordlist = *pathFile // user override
+			}
 
-		if pathWordlist != "" {
-			pathLines, pathErr := readInputFile(pathWordlist)
-			if pathErr != nil {
-				fmt.Printf("%s[!] Warning:%s Could not load paths wordlist: %v (skipping path fuzzing)\n", Yellow, Reset, pathErr)
-			} else if len(pathLines) > 0 {
-				probeResults = fuzzPaths(probeResults, pathLines)
+			if pathWordlist != "" {
+				pathLines, pathErr := readInputFile(pathWordlist)
+				if pathErr != nil {
+					fmt.Printf("%s[!] Warning:%s Could not load paths wordlist: %v (skipping path fuzzing)\n", Yellow, Reset, pathErr)
+				} else if len(pathLines) > 0 {
+					probeResults = fuzzPaths(probeResults, pathLines)
+				}
 			}
 		}
 

@@ -4,10 +4,11 @@ A fast, concurrent web port scanner and HTTP reconnaissance tool written in Go.
 
 ## Features
 
+- **Subnet & Host Discovery** — Accepts single hosts, CIDR blocks (`10.0.0.0/24`) and dash ranges (`10.0.0.1-50`); runs a fast TCP liveness sweep so only live hosts get full-scanned
 - **Port Scanning** — Concurrent TCP port probing with configurable timeouts and rate limiting
 - **HTTP Probing** — Automatic scheme detection (HTTP/HTTPS), response headers, page titles, redirects
 - **Header Recon** — Detects web servers, frameworks, WAFs, CDNs, CMSs via response headers
-- **Directory Fuzzing** — Path discovery with built-in wordlist and 403 bypass techniques
+- **Directory Fuzzing** — *Optional* (`-fuzz`) path discovery with built-in wordlist and 403 bypass techniques
 - **Wildcard Detection** — Filters false positives across all HTTP status ranges (2xx–5xx)
 - **DNS Enrichment** — CNAME and PTR (reverse DNS) lookups for each target
 - **SSL Certificate Info** — Extracts Common Name (CN) and Subject Alternative Names (SANs)
@@ -26,11 +27,23 @@ A fast, concurrent web port scanner and HTTP reconnaissance tool written in Go.
 # Single target
 wScanner -host 10.0.0.1
 
-# Multiple targets from file
+# Scan a whole subnet — expands the CIDR and runs host discovery first
+wScanner -host 10.0.0.0/24
+
+# Dash range (last-octet shorthand supported: 10.0.0.1-50)
+wScanner -host 10.0.0.1-10.0.0.50
+
+# Scan every host in a subnet WITHOUT the discovery pre-filter
+wScanner -host 10.0.0.0/24 -skip-discovery
+
+# Multiple targets from file (CIDRs/ranges allowed, one per line)
 wScanner -input targets.txt
 
+# Enable directory fuzzing (off by default)
+wScanner -host 10.0.0.1 -fuzz
+
 # With options
-wScanner -host 10.0.0.1 -timeout 10 -csv -output my_scan -path custom_wordlist.txt
+wScanner -host 10.0.0.1 -timeout 10 -csv -output my_scan -fuzz -path custom_wordlist.txt
 
 # Increase concurrency and rate limit
 wScanner -input targets.txt -c 2048 -rps 500
@@ -49,8 +62,11 @@ wScanner -update
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-host` | — | Single target to scan |
-| `-input` | — | File with targets (one per line) |
+| `-host` | — | Single target to scan — hostname, IP, CIDR (`10.0.0.0/24`) or range (`10.0.0.1-50`) |
+| `-input` | — | File with targets (one per line; CIDRs/ranges allowed) |
+| `-fuzz` | `false` | Enable directory/path fuzzing (auto-enabled when `-path` is given) |
+| `-skip-discovery` | `false` | Scan every host in a CIDR/range without the host-discovery pre-filter |
+| `-discovery-ports` | `80,443,22,8080,8443,3389,445,21,25,3306` | Ports used for TCP host discovery |
 | `-timeout` | `15` | Request timeout in seconds |
 | `-c` | `0` | Max concurrent workers (0 = auto, capped at 1024) |
 | `-rps` | `0` | Max requests per second (0 = unlimited) |
@@ -58,8 +74,8 @@ wScanner -update
 | `-output` | auto | Custom output folder name |
 | `-csv` | `false` | Generate CSV results |
 | `-stdout` | `true` | Print results to standard output |
-| `-path` | — | Custom wordlist for directory fuzzing |
-| `-ports-file` | `ports.txt` | Custom ports file |
+| `-path` | — | Custom wordlist for directory fuzzing (implies `-fuzz`) |
+| `-ports-file` | `ports.txt` | Custom ports file (an explicit existing path overrides the cached list) |
 | `-force-cf` | `false` | Force scanning Cloudflare IPs |
 | `-v` | `false` | Verbose output |
 | `-local` | `false` | Skip internet check |
@@ -74,6 +90,7 @@ Each scan produces an output folder with the following files:
 |------|-------------|
 | `output_report.html` | Interactive HTML report with filters and search |
 | `output_urls.txt` | Plain list of discovered URLs |
+| `live_hosts.txt` | Live hosts found during discovery (CIDR/range scans) |
 | `validated.txt` | Endpoints returning valid 2xx/3xx responses |
 | `fuzzing.txt` | Path fuzzing results grouped by target |
 | `rechecked_ports.txt` | Ports re-checked after returning no initial data |

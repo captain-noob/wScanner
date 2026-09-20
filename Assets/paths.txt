@@ -15,6 +15,9 @@ appveyor.yml
 phppgadmin
 phpadmin
 buildspec.yml
+.github
+.github/dependabot.yml
+.github/workflows/dependabot.yml
 cloudbuild.yaml
 Dockerfile
 docker-compose.yml
