@@ -4,7 +4,7 @@ A fast, concurrent web port scanner and HTTP reconnaissance tool written in Go.
 
 ## Features
 
-- **Subnet & Host Discovery** — Accepts single hosts, CIDR blocks (`10.0.0.0/24`) and dash ranges (`10.0.0.1-50`); runs a fast TCP liveness sweep so only live hosts get full-scanned
+- **Subnet & Host Discovery** — Accepts single hosts, CIDR blocks (`10.0.0.0/24`) and dash ranges (`10.0.0.1-50`); finds live hosts via **ARP** (local subnet), **ICMP** ping, or **TCP** connect so only live hosts get full-scanned. URLs pasted to `-host` are normalized to their host
 - **Port Scanning** — Concurrent TCP port probing with configurable timeouts and rate limiting
 - **HTTP Probing** — Automatic scheme detection (HTTP/HTTPS), response headers, page titles, redirects
 - **Header Recon** — Detects web servers, frameworks, WAFs, CDNs, CMSs via response headers
@@ -36,6 +36,9 @@ wScanner -host 10.0.0.1-10.0.0.50
 # Scan every host in a subnet WITHOUT the discovery pre-filter
 wScanner -host 10.0.0.0/24 -skip-discovery
 
+# Choose a discovery method (auto = ARP local + ICMP remote, TCP fallback)
+wScanner -host 10.0.0.0/24 -discovery-method icmp
+
 # Multiple targets from file (CIDRs/ranges allowed, one per line)
 wScanner -input targets.txt
 
@@ -58,6 +61,8 @@ wScanner -host cdn.example.com -force-cf
 wScanner -update
 ```
 
+> **Discovery privileges:** ARP and ICMP use raw sockets, which need root/`CAP_NET_RAW` on Linux or Administrator on Windows (ICMP also works unprivileged on Linux when `net.ipv4.ping_group_range` allows). When the privileged method can't be initialized, discovery automatically falls back to a TCP-connect sweep on `-discovery-ports`. ARP only reaches hosts on a directly-attached subnet.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -66,7 +71,8 @@ wScanner -update
 | `-input` | — | File with targets (one per line; CIDRs/ranges allowed) |
 | `-fuzz` | `false` | Enable directory/path fuzzing (auto-enabled when `-path` is given) |
 | `-skip-discovery` | `false` | Scan every host in a CIDR/range without the host-discovery pre-filter |
-| `-discovery-ports` | `80,443,22,8080,8443,3389,445,21,25,3306` | Ports used for TCP host discovery |
+| `-discovery-method` | `auto` | Host-discovery method: `auto` (ARP for local subnet + ICMP for the rest, TCP fallback), `icmp`, `arp`, or `tcp` |
+| `-discovery-ports` | `80,443,22,8080,8443,3389,445,21,25,3306` | Ports used by the `tcp` discovery method / fallback |
 | `-timeout` | `15` | Request timeout in seconds |
 | `-c` | `0` | Max concurrent workers (0 = auto, capped at 1024) |
 | `-rps` | `0` | Max requests per second (0 = unlimited) |

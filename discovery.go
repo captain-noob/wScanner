@@ -252,44 +252,162 @@ func parseDiscoveryPorts(spec string) []string {
 	return ports
 }
 
-// discoverLiveHosts performs a fast TCP-connect liveness sweep over the given
-// hosts. A host is considered alive if any of the discovery ports accepts a
-// connection within a short timeout. Live hosts are written to
-// live_hosts.txt in the output folder. Ordering of the input is preserved.
-func discoverLiveHosts(hosts []string, discoveryPorts []string) []string {
+// discoveryTimeout returns how long to wait for a liveness reply. It stays snappy
+// and only tightens toward the user -timeout when that is positive and smaller —
+// a 0/negative -timeout must not be propagated (net.Dialer treats a zero Timeout
+// as "no timeout"). main() also clamps -timeout at startup.
+func discoveryTimeout() time.Duration {
+	to := 1500 * time.Millisecond
+	if ut := time.Duration(*time_out) * time.Second; ut > 0 && ut < to {
+		to = ut
+	}
+	return to
+}
+
+// discoverLiveHosts finds which hosts are alive, using the requested method:
+//
+//	auto  — ARP for local-subnet hosts (Linux+root) + ICMP for the rest,
+//	        falling back to TCP-connect when the privileged method is unavailable.
+//	icmp  — ICMP echo sweep (falls back to TCP if no ICMP socket can be opened).
+//	arp   — ARP ping for local-subnet hosts; other hosts go to TCP.
+//	tcp   — TCP-connect on the discovery ports (always available, unprivileged).
+//
+// Live hosts are written to live_hosts.txt; input ordering is preserved.
+func discoverLiveHosts(hosts []string, method string, tcpPorts []string) []string {
 	total := len(hosts)
 	if total == 0 {
 		return hosts
 	}
 
-	fmt.Printf("%s[*]%s Host discovery on %s%d%s hosts (ports: %s)...\n",
-		Cyan, Reset, Bold, total, Reset, strings.Join(discoveryPorts, ","))
-
-	bar := NewProgressBar(total)
-
-	// Short per-connection timeout keeps discovery snappy; a live host on a
-	// LAN or nearby network answers in well under a second.
-	// Keep discovery snappy. Only tighten toward the user timeout when it is a
-	// positive value smaller than the default — a 0/negative -timeout must not
-	// be propagated, since net.Dialer treats a zero Timeout as "no timeout"
-	// and discovery would then hang on every filtered host (for the OS default,
-	// which is ~2min on Linux vs ~21s on Windows).
-	dialTimeout := 1500 * time.Millisecond
-	if ut := time.Duration(*time_out) * time.Second; ut > 0 && ut < dialTimeout {
-		dialTimeout = ut
+	to := discoveryTimeout()
+	method = strings.ToLower(strings.TrimSpace(method))
+	if method == "" {
+		method = "auto"
 	}
 
-	type discoOut struct {
-		Idx   int
-		Alive bool
+	live := make(map[string]bool)
+	var used []string
+	merge := func(m map[string]bool) {
+		for h := range m {
+			live[h] = true
+		}
 	}
 
-	jobs := make(chan int, 4096)
-	outs := make(chan discoOut, 4096)
+	fmt.Printf("%s[*]%s Host discovery (%s%s%s) on %s%d%s hosts...\n",
+		Cyan, Reset, Bold, method, Reset, Bold, total, Reset)
+
+	switch method {
+	case "tcp":
+		merge(tcpDiscover(hosts, tcpPorts, to))
+		used = append(used, "tcp")
+
+	case "arp":
+		v4, other := splitIPv4(hosts)
+		local, remote := localSubnetHosts(v4)
+		if arpAvailable() && len(local) > 0 {
+			if s, ok := arpDiscover(local, to); ok {
+				merge(s)
+				used = append(used, "arp")
+			} else {
+				remote = append(remote, local...)
+			}
+		} else {
+			if len(local) > 0 {
+				fmt.Printf("%s[!]%s ARP unavailable (needs Linux + root) — using TCP for local hosts\n", Yellow, Reset)
+			}
+			remote = append(remote, local...)
+		}
+		rest := append(remote, other...)
+		if len(rest) > 0 {
+			merge(tcpDiscover(rest, tcpPorts, to))
+			used = append(used, "tcp")
+		}
+
+	case "icmp":
+		v4, other := splitIPv4(hosts)
+		if len(v4) > 0 {
+			if s, ok := icmpDiscover(v4, to); ok {
+				merge(s)
+				used = append(used, "icmp")
+			} else {
+				fmt.Printf("%s[!]%s ICMP unavailable (needs privileges) — falling back to TCP\n", Yellow, Reset)
+				merge(tcpDiscover(v4, tcpPorts, to))
+				used = append(used, "tcp")
+			}
+		}
+		if len(other) > 0 {
+			merge(tcpDiscover(other, tcpPorts, to))
+			used = append(used, "tcp")
+		}
+
+	default: // auto
+		v4, other := splitIPv4(hosts)
+		local, remote := localSubnetHosts(v4)
+		arpOK := false
+		if arpAvailable() && len(local) > 0 {
+			if s, ok := arpDiscover(local, to); ok {
+				merge(s)
+				used = append(used, "arp")
+				arpOK = true
+			}
+		}
+		pingTargets := remote
+		if !arpOK {
+			pingTargets = v4 // ARP unavailable/failed → ICMP-ping every IPv4 host
+		}
+		if len(pingTargets) > 0 {
+			if s, ok := icmpDiscover(pingTargets, to); ok {
+				merge(s)
+				used = append(used, "icmp")
+			} else {
+				fmt.Printf("%s[!]%s ICMP unavailable (needs privileges) — falling back to TCP\n", Yellow, Reset)
+				merge(tcpDiscover(pingTargets, tcpPorts, to))
+				used = append(used, "tcp")
+			}
+		}
+		if len(other) > 0 { // IPv6 / hostnames: ICMPv4 & ARP don't apply
+			merge(tcpDiscover(other, tcpPorts, to))
+			used = append(used, "tcp")
+		}
+	}
+
+	// Preserve input order.
+	var out []string
+	for _, h := range hosts {
+		if live[h] {
+			out = append(out, h)
+		}
+	}
+
+	writeLiveHosts(out)
+
+	fmt.Printf("%s[+]%s Host discovery complete (%s): %s%d%s of %s%d%s hosts are live.\n",
+		Green, Reset, dedupJoin(used, "+"), Bold, len(out), Reset, Bold, total, Reset)
+
+	return out
+}
+
+// tcpDiscover marks a host live if any of the discovery ports accepts a TCP
+// connection within the timeout. Always available and unprivileged.
+func tcpDiscover(hosts []string, ports []string, timeout time.Duration) map[string]bool {
+	live := make(map[string]bool)
+	if len(hosts) == 0 {
+		return live
+	}
+	if len(ports) == 0 {
+		ports = []string{"80", "443", "22", "8080", "8443", "445"}
+	}
+
+	type out struct {
+		host  string
+		alive bool
+	}
+	jobs := make(chan string, 4096)
+	outs := make(chan out, 4096)
 
 	workerCount := getConcurrencyLimit()
-	if total < workerCount {
-		workerCount = total
+	if len(hosts) < workerCount {
+		workerCount = len(hosts)
 	}
 
 	var wg sync.WaitGroup
@@ -297,54 +415,99 @@ func discoverLiveHosts(hosts []string, discoveryPorts []string) []string {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
+			for h := range jobs {
 				atomic.AddInt64(&activeGoroutines, 1)
 				alive := false
-				for _, port := range discoveryPorts {
-					d := net.Dialer{Timeout: dialTimeout}
-					conn, err := d.Dial("tcp", net.JoinHostPort(hosts[idx], port))
+				for _, port := range ports {
+					d := net.Dialer{Timeout: timeout}
+					conn, err := d.Dial("tcp", net.JoinHostPort(h, port))
 					if err == nil {
 						conn.Close()
 						alive = true
 						break
 					}
 				}
-				outs <- discoOut{Idx: idx, Alive: alive}
+				outs <- out{host: h, alive: alive}
 				atomic.AddInt64(&activeGoroutines, -1)
-				bar.Update(1)
 			}
 		}()
 	}
 
 	throttle, stopThrottle := newRPSThrottle()
 	go func() {
-		for i := range hosts {
+		for _, h := range hosts {
 			throttle()
-			jobs <- i
+			jobs <- h
 		}
 		close(jobs)
 		stopThrottle()
 	}()
-
 	go func() {
 		wg.Wait()
 		close(outs)
 	}()
 
-	aliveFlags := make([]bool, total)
 	for o := range outs {
-		aliveFlags[o.Idx] = o.Alive
-	}
-	fmt.Println()
-
-	var live []string
-	for i, ok := range aliveFlags {
-		if ok {
-			live = append(live, hosts[i])
+		if o.alive {
+			live[o.host] = true
 		}
 	}
+	return live
+}
 
-	// Persist live hosts for the record / resume inspection.
+// splitIPv4 separates IPv4-literal hosts from everything else (IPv6 literals and
+// hostnames), which are routed to TCP discovery since ICMPv4/ARP don't apply.
+func splitIPv4(hosts []string) (v4 []string, other []string) {
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil && ip.To4() != nil {
+			v4 = append(v4, h)
+		} else {
+			other = append(other, h)
+		}
+	}
+	return v4, other
+}
+
+// localSubnetHosts partitions IPv4 hosts into those on a directly-connected,
+// non-loopback interface subnet (ARP-reachable) and the rest.
+func localSubnetHosts(v4 []string) (local []string, remote []string) {
+	var nets []*net.IPNet
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, ifi := range ifaces {
+			if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 || len(ifi.HardwareAddr) != 6 {
+				continue
+			}
+			addrs, aerr := ifi.Addrs()
+			if aerr != nil {
+				continue
+			}
+			for _, a := range addrs {
+				if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+					nets = append(nets, ipnet)
+				}
+			}
+		}
+	}
+	for _, h := range v4 {
+		ip := net.ParseIP(h)
+		isLocal := false
+		for _, n := range nets {
+			if n.Contains(ip) {
+				isLocal = true
+				break
+			}
+		}
+		if isLocal {
+			local = append(local, h)
+		} else {
+			remote = append(remote, h)
+		}
+	}
+	return local, remote
+}
+
+// writeLiveHosts persists the live host list for the record / resume inspection.
+func writeLiveHosts(live []string) {
 	fname := folderName + "/live_hosts.txt"
 	if f, err := os.Create(fname); err == nil {
 		for _, h := range live {
@@ -352,9 +515,21 @@ func discoverLiveHosts(hosts []string, discoveryPorts []string) []string {
 		}
 		f.Close()
 	}
+}
 
-	fmt.Printf("%s[+]%s Host discovery complete: %s%d%s of %s%d%s hosts are live.\n",
-		Green, Reset, Bold, len(live), Reset, Bold, total, Reset)
-
-	return live
+// dedupJoin joins the strings with sep after removing duplicates, preserving
+// first-seen order (e.g. ["arp","icmp","tcp"] -> "arp+icmp+tcp").
+func dedupJoin(items []string, sep string) string {
+	seen := make(map[string]bool)
+	var uniq []string
+	for _, it := range items {
+		if !seen[it] {
+			seen[it] = true
+			uniq = append(uniq, it)
+		}
+	}
+	if len(uniq) == 0 {
+		return "none"
+	}
+	return strings.Join(uniq, sep)
 }

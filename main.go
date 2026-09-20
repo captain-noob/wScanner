@@ -74,7 +74,8 @@ var (
 	maxRetries   = flag.Int("retries", 2, "Number of **retries** for failed HTTP requests (transport errors only).")
 	enableFuzz   = flag.Bool("fuzz", false, "Enable **directory/path fuzzing** (disabled by default; auto-enabled when -path is given).")
 	skipDisco    = flag.Bool("skip-discovery", false, "Scan **every host** in a CIDR/range without host-discovery pre-filtering.")
-	discoPorts   = flag.String("discovery-ports", "80,443,22,8080,8443,3389,445,21,25,3306", "Comma-separated ports used for TCP **host discovery** on CIDR/range inputs.")
+	discoMethod  = flag.String("discovery-method", "auto", "**Host discovery** method for CIDR/range inputs: auto|icmp|arp|tcp.")
+	discoPorts   = flag.String("discovery-ports", "80,443,22,8080,8443,3389,445,21,25,3306", "Comma-separated ports used for **TCP host discovery** (tcp method / fallback).")
 )
 
 // Cloudflare IP ranges (populated by init)
@@ -2467,7 +2468,7 @@ func main() {
 		fmt.Printf("%s[*]%s Expanded input to %s%d%s hosts\n", Cyan, Reset, Bold, len(targets), Reset)
 	}
 	if didExpand && !*skipDisco && state.CompletedPhase < PhasePortScan {
-		live := discoverLiveHosts(targets, parseDiscoveryPorts(*discoPorts))
+		live := discoverLiveHosts(targets, *discoMethod, parseDiscoveryPorts(*discoPorts))
 		if len(live) == 0 {
 			fmt.Printf("%s[!]%s No live hosts found during discovery. Use %s-skip-discovery%s to scan all hosts anyway.\n",
 				Yellow, Reset, Bold, Reset)
